@@ -1,0 +1,2070 @@
+# =====================================================================
+# RBO GENOMİK MAKALE — step00 - step12  (kümülatif kod; step10-12 =  ek analizler)
+# step00: klasör ve ayarlar
+# step01: fonksiyonlar (RBO hesaplama + H0 altında kesin dağılım)
+# step02: sentetik veriyle doğrulama (kesin dağılım = Monte Carlo mu?)  -> çıktıları varsa ATLANIR
+# step03: gerçek veri yükleme testi (MAQC mikrodizi + SEQC RNA-seq + TaqMan)
+#         Yol A = Bioconductor paketleri (MAQCsubset, seqc)
+#         Yol B = GEO'dan doğrudan indirme (yalnızca temel R, Bioconductor gerekmez)
+# step04: kalibrasyon (sentetik veri için gerçek veriden parametre) + ilk bakış: gürültü tavanı
+# step05: simülasyon — gerçek veriden kalibre edilmiş sahte laboratuvarlarla rho tahmincisi ve permütasyon testi
+# step06: gerçek veri çıkarımı — her laboratuvar çifti için permütasyon p-değeri, kappa tahmini ve %95 güven aralığı
+# step07: genel ve laboratuvar bazında permütasyon testi (tüm laboratuvarlar tek permütasyon kümesi),
+#         iki partili tekrar simülasyonu (S2b) ve laboratuvar içi tekrar korelasyonları
+# step08: parti teşhisi + partiye duyarlı rho (MAY) + bir laboratuvarı dışarıda bırakan genel testler
+# step09: makale şekilleri (figures klasörü, 1600 dpi PNG + PDF, İngilizce, başlıksız) ve tablolar
+# İnternet yalnızca step03'te ve yalnızca İLK çalıştırmada gerekir (sonra .rds'den okunur).
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# step00: KLASÖR VE AYARLAR
+# ---------------------------------------------------------------------
+path_A <- "C:/Users/Alper.Tosun/Desktop/cru130"             # Yol A: ana bilgisayardaki cru130
+path_B <- "C:/Users/autos/OneDrive/Desktop/cru130"          # Yol B: ikinci bilgisayardaki cru130
+
+if (dir.exists(path_A)) {                                   # Yol A klasörü varsa
+  root_dir <- path_A                                        #   onu kullan
+} else if (dir.exists(path_B)) {                            # yoksa Yol B klasörü varsa
+  root_dir <- path_B                                        #   onu kullan
+} else {                                                    # ikisi de yoksa
+  stop("cru130 klasörü bulunamadı. path_A veya path_B satırını düzeltin.")  # dur ve uyar
+}
+
+base_dir <- file.path(root_dir, "rbo_genomics")             # proje klasörünün tam yolu
+if (!dir.exists(base_dir)) dir.create(base_dir)             # klasör yoksa oluştur (varsa dokunma)
+setwd(base_dir)                                             # çalışma klasörünü proje klasörü yap
+cat("Proje klasörü:", base_dir, "\n")                       # hangi klasörde çalıştığımızı yaz
+
+REDO_STEP02 <- FALSE        # TRUE yaparsanız step02 çıktıları olsa bile yeniden hesaplanır
+B_MC        <- 20000        # Monte Carlo tekrar sayısı (H0 altında rastgele liste çifti)
+N_BINS      <- 20000        # kesin dağılım için skor ızgarasının hücre sayısı
+set.seed(20261025)          # sonuçlar her çalıştırmada aynı çıksın
+
+# ---------------------------------------------------------------------
+# step01: FONKSİYONLAR
+# ---------------------------------------------------------------------
+
+# --- 1a) Örtüşme yolu X_d: her derinlik d için ilk d öğedeki ortak öğe sayısı ---
+
+# Yol A (hızlı): her ortak öğe, iki listedeki sırasının büyüğü olan derinlikten itibaren sayılır
+overlap_path_A <- function(S, Tl, k) {
+  S  <- S[1:k]; Tl <- Tl[1:k]                               # iki listenin ilk k öğesini al
+  j  <- match(S, Tl)                                        # S'deki her öğenin T'deki sırası (yoksa NA)
+  i  <- seq_len(k)                                          # S'deki sıralar 1..k
+  ok <- !is.na(j)                                           # iki listede de olan öğeler
+  m  <- pmax(i[ok], j[ok])                                  # öğenin "görüldüğü" derinlik = iki sıranın büyüğü
+  cumsum(tabulate(m, nbins = k))                            # derinlik derinlik birikimli ortak sayısı
+}
+
+# Yol B (yavaş ama çok basit): her derinlikte kesişimi doğrudan say
+overlap_path_B <- function(S, Tl, k) {
+  sapply(seq_len(k), function(d) length(intersect(S[1:d], Tl[1:d])))  # her d için |S_1:d ∩ T_1:d|
+}
+
+# --- 1b) RBO ağırlıkları: RBO = sum_d w_d * X_d  (hem önek hem ekstrapole RBO doğrusal) ---
+rbo_weights <- function(k, p, type = c("prefix", "ext")) {
+  type <- match.arg(type)                                   # "prefix" = RBO@k, "ext" = RBO_EXT
+  d <- seq_len(k)                                           # derinlikler 1..k
+  w <- (1 - p) * p^(d - 1) / d                              # Webber vd. (2010) ağırlıkları: (1-p) p^(d-1) / d
+  if (type == "ext") w[k] <- w[k] + p^k / k                 # RBO_EXT: son derinliğe X_k p^k / k terimi eklenir
+  w                                                         # ağırlık vektörünü döndür
+}
+
+# --- 1c) İki listenin RBO değeri ---
+rbo_value <- function(S, Tl, k, p, type = "ext", method = "A") {
+  X <- if (method == "A") overlap_path_A(S, Tl, k) else overlap_path_B(S, Tl, k)  # örtüşme yolu
+  sum(rbo_weights(k, p, type) * X)                          # ağırlıklı toplam = RBO
+}
+
+# --- 1d) H0 altında tek adım geçiş olasılıkları (Teorem 1) ---
+# H0: iki liste, N öğelik evrenin birbirinden bağımsız, tamamen rastgele sıralamaları.
+# X_{d-1} = x iken bir sonraki derinlikte artış 0, 1 veya 2 olabilir.
+step_probs <- function(x, dprev, N) {
+  r  <- N - dprev                                           # her listede henüz görülmemiş öğe sayısı
+  a  <- (dprev - x) / r                                     # yeni öğenin diğer listenin önekinde olma olasılığı
+  p2 <- a^2                                                 # iki yeni öğe de karşı listede zaten var: +2
+  p1 <- 2 * a * (1 - a) + (1 - a) / r                       # tek taraf eşleşir ya da iki yeni öğe aynı: +1
+  p0 <- (1 - a) * (1 - a - 1 / r)                           # hiçbir eşleşme yok: +0
+  c(p0, p1, p2)                                             # (artış 0, 1, 2) olasılıkları
+}
+
+# --- 1e) Yol A: H0 altında KESİN ortalama ve varyans (yuvarlama yok) ---
+null_moments_exact <- function(N, k, w) {
+  m0 <- c(1, rep(0, k)); m1 <- rep(0, k + 1); m2 <- rep(0, k + 1)  # x=0..k için P, E[T;x], E[T^2;x]
+  for (d in seq_len(k)) {                                   # her derinlik için
+    n0 <- n1 <- n2 <- rep(0, k + 1)                         # yeni derinliğin boş tabloları
+    for (x in 0:(d - 1)) {                                  # önceki derinlikte mümkün x değerleri
+      if (m0[x + 1] == 0) next                              # olasılığı sıfır olan durumu atla
+      pr <- step_probs(x, d - 1, N)                         # geçiş olasılıkları
+      for (inc in 0:2) {                                    # artış 0, 1, 2
+        xn <- x + inc                                       # yeni örtüşme
+        if (xn > d) next                                    # d'den büyük olamaz
+        a  <- w[d] * xn                                     # bu adımda skora eklenen miktar
+        q  <- pr[inc + 1]                                   # geçiş olasılığı
+        n0[xn + 1] <- n0[xn + 1] + q * m0[x + 1]            # olasılık güncelle
+        n1[xn + 1] <- n1[xn + 1] + q * (m1[x + 1] + a * m0[x + 1])                          # 1. moment
+        n2[xn + 1] <- n2[xn + 1] + q * (m2[x + 1] + 2 * a * m1[x + 1] + a^2 * m0[x + 1])    # 2. moment
+      }
+    }
+    m0 <- n0; m1 <- n1; m2 <- n2                            # bir sonraki derinliğe geç
+  }
+  mu <- sum(m1); v <- sum(m2) - mu^2                        # kesin ortalama ve varyans
+  list(mean = mu, sd = sqrt(max(v, 0)), pX_k = m0)          # pX_k = X_k'nın kesin dağılımı
+}
+
+# --- 1f) Yol A: H0 altında KESİN dağılım (dinamik programlama) ---
+# Fikir: RBO = sum_d w_d X_d = sum_j Delta_j * W_j,  W_j = w_j + ... + w_k (kuyruk ağırlığı),
+# Delta_j = X_j - X_{j-1} ∈ {0,1,2}. Her artış skoru Delta_j * W_j kadar büyütür.
+# Bu artışlar ızgaraya yuvarlanır: T_hat = h * sum_j round(Delta_j * W_j / h).
+# DP, T_hat'in dağılımını TAM olarak verir; |T_hat - T| <= X_k * h / 2 (çok küçük).
+# Gözlenen listeler için de aynı T_hat kullanılırsa test kesin geçerlidir.
+null_dist_dp <- function(N, k, w, mom, n_bins = N_BINS) {
+  W     <- rev(cumsum(rev(w)))                              # kuyruk ağırlıkları W_j
+  t_max <- sum(w * seq_len(k))                              # teorik en büyük skor (listeler aynıysa)
+  m_up  <- qhyper(1e-12, k, N - k, k, lower.tail = FALSE)   # P(X_k > m_up) < 1e-12 (X_k hipergeometrik)
+  t_cap <- min(t_max, max(m_up, 1) * W[1])                  # T <= X_k * W_1 olduğundan güvenli üst sınır
+  h     <- t_cap / (n_bins - 1)                             # ızgara hücre genişliği
+  s1    <- round(W / h); s2 <- round(2 * W / h)             # artış 1 ve 2 için kaç hücre kayılacağı
+  P     <- matrix(0, k + 1, n_bins)                         # satır = x (0..k), sütun = skor hücresi
+  P[1, 1] <- 1                                              # başlangıç: x = 0, skor = 0
+  shift_cols <- function(M, s) {                            # matrisin sütunlarını s hücre sağa kaydır
+    if (s == 0) return(M)                                   # kayma yoksa aynen döndür
+    out <- matrix(0, nrow(M), n_bins)                       # boş matris
+    if (s < n_bins) out[, (1 + s):n_bins] <- M[, 1:(n_bins - s), drop = FALSE]  # kaydırılmış kısım
+    keep <- max(1, n_bins - s + 1)                          # taşan sütunların başlangıcı
+    out[, n_bins] <- out[, n_bins] + rowSums(M[, keep:n_bins, drop = FALSE])    # taşan kütleyi son hücreye ekle
+    out
+  }
+  for (d in seq_len(k)) {                                   # her derinlik için
+    x   <- 0:(d - 1)                                        # önceki derinlikte mümkün x değerleri
+    r   <- N - (d - 1)                                      # görülmemiş öğe sayısı
+    a   <- (d - 1 - x) / r                                  # Teorem 1'deki a (vektör)
+    p0  <- (1 - a) * (1 - a - 1 / r)                        # artış 0 olasılıkları
+    p1  <- 2 * a * (1 - a) + (1 - a) / r                    # artış 1 olasılıkları
+    p2  <- a^2                                              # artış 2 olasılıkları
+    Pr  <- P[x + 1, , drop = FALSE]                         # ilgili satırlar (x = 0..d-1)
+    Q   <- matrix(0, k + 1, n_bins)                         # yeni olasılık tablosu
+    Q[x + 1, ] <- Q[x + 1, , drop = FALSE] + p0 * Pr                         # artış 0: skor değişmez
+    Q[x + 2, ] <- Q[x + 2, , drop = FALSE] + p1 * shift_cols(Pr, s1[d])      # artış 1: W_d kadar kay
+    ok2 <- which(x + 2 <= d)                                # artış 2 mümkün olan satırlar
+    if (length(ok2) > 0)                                    # varsa
+      Q[x[ok2] + 3, ] <- Q[x[ok2] + 3, , drop = FALSE] +
+        p2[ok2] * shift_cols(Pr[ok2, , drop = FALSE], s2[d])                 # artış 2: 2*W_d kadar kay
+    P <- Q                                                  # bir sonraki derinliğe geç
+  }
+  list(value = (0:(n_bins - 1)) * h, prob = colSums(P),     # skor değerleri ve olasılıkları
+       h = h, s1 = s1, s2 = s2, n_bins = n_bins,            # ızgara bilgileri (gözlenen skor için gerekli)
+       tail_mass = sum(P[, n_bins]))                        # üst sınırın ötesindeki kütle
+}
+
+# --- 1g) Gözlenen örtüşme yolundan ızgara skoru T_hat (DP ile aynı yuvarlama) ---
+score_grid <- function(X, dist) {
+  X     <- matrix(X, ncol = length(dist$s1))                # tek yol da olsa matris yap
+  Delta <- X - cbind(0, X[, -ncol(X), drop = FALSE])        # her derinlikteki artış (0, 1, 2)
+  cells <- (Delta == 1) %*% dist$s1 + (Delta == 2) %*% dist$s2  # toplam hücre kayması
+  as.vector(pmin(cells, dist$n_bins - 1)) * dist$h          # üst sınırla kes ve skora çevir
+}
+
+# --- 1h) Kesin p-değeri: P(T_hat >= T_hat_gözlenen) ---
+pvalue_dp <- function(t_hat, dist) {
+  cs <- rev(cumsum(rev(dist$prob)))                         # sağ kuyruk olasılıkları
+  cs[pmin(round(t_hat / dist$h) + 1, dist$n_bins)]          # gözlenen hücreden itibaren toplam olasılık
+}
+
+# --- 1i) Kesin dağılımdan quantile ---
+quantile_dp <- function(prob_level, dist) {
+  cdf <- cumsum(dist$prob)                                  # birikimli dağılım
+  sapply(prob_level, function(a) dist$value[which(cdf >= a - 1e-12)[1]])  # cdf'nin a'yı ilk geçtiği değer
+}
+
+# --- 1j) Yol B: H0 altında Monte Carlo (permütasyon) ile örtüşme yolları ---
+null_paths_mc <- function(N, k, B) {
+  t(replicate(B, overlap_path_A(sample.int(N, k), sample.int(N, k), k)))  # B satır x k sütun
+}
+
+# --- 1k) Kolmogorov-Smirnov uzaklığı: kesin dağılım vs Monte Carlo (aynı T_hat üzerinde) ---
+ks_dp_mc <- function(dist, t_hat_mc) {
+  cdf  <- cumsum(dist$prob)                                 # kesin cdf (hücre bazında)
+  cell <- round(t_hat_mc / dist$h) + 1                      # MC değerlerinin hücre numaraları
+  tab  <- tabulate(cell, nbins = dist$n_bins) / length(cell)  # MC olasılıkları (hücre bazında)
+  max(abs(cdf - cumsum(tab)))                               # en büyük cdf farkı
+}
+
+# ---------------------------------------------------------------------
+# step01 küçük kontrol: makaledeki örnek (A,B,C) vs (B,A,D), p = 0.9
+# ---------------------------------------------------------------------
+ex_A <- rbo_value(c("A","B","C"), c("B","A","D"), 3, 0.9, "ext", "A")  # Yol A ile RBO_EXT
+ex_B <- rbo_value(c("A","B","C"), c("B","A","D"), 3, 0.9, "ext", "B")  # Yol B ile RBO_EXT
+cat(sprintf("Örnek RBO_EXT: Yol A = %.4f, Yol B = %.4f (beklenen 0.6300)\n", ex_A, ex_B))  # ikisi aynı olmalı
+
+# ---------------------------------------------------------------------
+# step02: SENTETİK DOĞRULAMA
+# ---------------------------------------------------------------------
+f_mom <- "step02_null_moments.csv"                          # çıktı 1: kesin vs MC ortalama/sd
+f_q   <- "step02_null_quantiles.csv"                        # çıktı 2: kesin vs MC quantile + KS
+f_t1  <- "step02_type1.csv"                                 # çıktı 3: tip I hata oranları
+
+if (!REDO_STEP02 && all(file.exists(c(f_mom, f_q, f_t1)))) {  # çıktılar zaten varsa
+  cat("step02 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP02 <- TRUE).\n")
+} else {
+
+  t_start <- Sys.time()                                     # süre ölçümü başlat
+  design  <- expand.grid(N = c(200, 2000, 20000),           # evren büyüklüğü (gen sayısı)
+                         k = c(10, 50, 100))                # liste derinliği
+  p_set   <- c(0.90, 0.98)                                  # RBO ağırlık parametresi
+  types   <- c("prefix", "ext")                             # RBO@k ve RBO_EXT
+  alphas  <- c(0.10, 0.05, 0.01)                            # tip I hata düzeyleri
+
+  out_mom <- list(); out_q <- list(); out_t1 <- list()      # sonuçları toplamak için boş listeler
+
+  for (r in seq_len(nrow(design))) {                        # her (N, k) kombinasyonu için
+    N <- design$N[r]; k <- design$k[r]                      # değerleri al
+    cat(sprintf("N = %d, k = %d ...\n", N, k))              # ilerlemeyi yaz
+
+    Xmc <- null_paths_mc(N, k, B_MC)                        # Yol B: H0 altında B_MC örtüşme yolu
+
+    # Yol A ve Yol B örtüşme fonksiyonları aynı sonucu veriyor mu? (200 rastgele çift)
+    impl_diff <- max(replicate(200, {                       # 200 kez dene
+      S <- sample.int(N, k); Tl <- sample.int(N, k)         # rastgele iki liste
+      max(abs(overlap_path_A(S, Tl, k) - overlap_path_B(S, Tl, k)))  # farkın en büyüğü
+    }))
+
+    for (p in p_set) for (ty in types) {                    # her p ve RBO türü için
+      w    <- rbo_weights(k, p, ty)                         # ağırlıklar
+      t_mc <- as.vector(Xmc %*% w)                          # Monte Carlo RBO değerleri
+      mom  <- null_moments_exact(N, k, w)                   # Yol A: kesin ortalama ve sd
+
+      hyp  <- dhyper(0:k, k, N - k, k)                      # X_k için hipergeometrik dağılım (kontrol)
+      hyp_diff <- max(abs(mom$pX_k - hyp))                  # zincirle hipergeometrik aynı olmalı
+
+      dist <- tryCatch(null_dist_dp(N, k, w, mom),          # Yol A: kesin dağılım
+                       error = function(e) NULL)            # hata olursa NULL dön
+      dp_ok <- !is.null(dist)                               # kesin dağılım çalıştı mı?
+
+      out_mom[[length(out_mom) + 1]] <- data.frame(         # momentler tablosuna satır ekle
+        N = N, k = k, p = p, type = ty,
+        mean_exact = mom$mean, mean_mc = mean(t_mc),        # kesin ve MC ortalama
+        sd_exact = mom$sd, sd_mc = sd(t_mc),                # kesin ve MC standart sapma
+        z_mean_diff = (mean(t_mc) - mom$mean) / (mom$sd / sqrt(B_MC)),  # fark / standart hata (|z|<3 beklenir)
+        maxdiff_chain_vs_hyper = hyp_diff,                  # zincir doğruluğu (~0 beklenir)
+        maxdiff_impl_A_vs_B = impl_diff)                    # iki örtüşme fonksiyonu farkı (0 beklenir)
+
+      t_hat <- if (dp_ok) score_grid(Xmc, dist) else t_mc   # MC yollarının ızgara skoru (DP ile aynı yuvarlama)
+      q_mc <- quantile(t_hat, c(0.95, 0.99), names = FALSE, type = 1)  # MC quantile'lar
+      q_dp <- if (dp_ok) quantile_dp(c(0.95, 0.99), dist) else c(NA, NA)  # kesin quantile'lar
+      out_q[[length(out_q) + 1]] <- data.frame(             # quantile tablosuna satır ekle
+        N = N, k = k, p = p, type = ty,
+        q95_exact = q_dp[1], q95_mc = q_mc[1],              # %95 quantile
+        q99_exact = q_dp[2], q99_mc = q_mc[2],              # %99 quantile
+        ks_exact_vs_mc = if (dp_ok) ks_dp_mc(dist, t_hat) else NA,  # KS uzaklığı
+        ks_5pct_critical = 1.36 / sqrt(B_MC),               # KS bu değerin altındaysa fark yok demektir
+        max_rounding_error = max(abs(t_hat - t_mc)),        # ızgara skoru ile gerçek RBO farkı (çok küçük beklenir)
+        tail_mass_beyond_cap = if (dp_ok) dist$tail_mass else NA,  # üst sınır ötesi olasılık (~0 beklenir)
+        dp_ok = dp_ok)                                      # kesin dağılım hesaplandı mı
+
+      if (dp_ok) {                                          # tip I hata: MC değerlerini kesin p-değeriyle test et
+        pv <- pvalue_dp(t_hat, dist)                        # her MC değeri için kesin p-değeri
+        for (al in alphas) {                                # her alfa için
+          rr <- mean(pv <= al)                              # reddetme oranı (alfa'dan küçük/eşit beklenir)
+          out_t1[[length(out_t1) + 1]] <- data.frame(
+            N = N, k = k, p = p, type = ty, alpha = al,
+            reject_rate = rr,                               # gözlenen tip I hata
+            mc_se = sqrt(al * (1 - al) / B_MC))             # MC standart hatası
+        }
+      }
+    }
+  }
+
+  write.csv(do.call(rbind, out_mom), f_mom, row.names = FALSE)   # çıktı 1'i kaydet
+  write.csv(do.call(rbind, out_q),   f_q,   row.names = FALSE)   # çıktı 2'yi kaydet
+  write.csv(do.call(rbind, out_t1),  f_t1,  row.names = FALSE)   # çıktı 3'ü kaydet
+  cat(sprintf("step02 bitti. Süre: %.1f dakika\n",
+              as.numeric(difftime(Sys.time(), t_start, units = "mins"))))  # toplam süreyi yaz
+}
+
+
+# ---------------------------------------------------------------------
+# step03: GERÇEK VERİ YÜKLEME TESTİ (analiz yok; yalnızca "veri geldi mi, yapısı ne?")
+# ---------------------------------------------------------------------
+REDO_STEP03 <- FALSE                                        # TRUE: step03 tablolarını yeniden üret (indirme yine .rds'den)
+options(timeout = 3600)                                     # büyük dosyalar için indirme süresini 1 saate çıkar
+options(repos = c(CRAN = "https://cloud.r-project.org"))    # CRAN adresi (sorulmadan kurulum için)
+
+# Yol B adresleri (GEO, NCBI)
+url_maqc_B   <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE5nnn/GSE5350/matrix/GSE5350-GPL570_series_matrix.txt.gz"  # MAQC Affymetrix (GPL570)
+url_maqc_dir <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE5nnn/GSE5350/matrix/"     # yukarıdaki olmazsa klasör listesi
+url_seqc_dir <- "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE47nnn/GSE47774/suppl/"    # SEQC ek dosyalar klasörü
+seqc_sites   <- c("AGR", "BGI", "CNL", "COH", "MAY", "NVS")  # SEQC Illumina HiSeq merkezleri
+
+f_check <- "step03_data_check.csv"                          # çıktı 1: hangi yol çalıştı?
+f_mdes  <- "step03_maqc_design.csv"                         # çıktı 2: MAQC laboratuvar x örnek x tekrar
+f_sdes  <- "step03_seqc_design.csv"                         # çıktı 3: SEQC + TaqMan laboratuvar x örnek x tekrar
+f_maqc  <- "step03_maqc_afx.rds"                            # önbellek: MAQC verisi (bir daha indirilmez)
+f_seqc  <- "step03_seqc_ilm.rds"                            # önbellek: SEQC verisi (bir daha indirilmez)
+
+# --- 3a) Yardımcı fonksiyonlar ---
+check_rows <- list()                                        # yol denemelerinin kaydı
+add_check <- function(dataset, way, status, n_feat = NA, n_col = NA, n_site = NA, msg = "") {
+  check_rows[[length(check_rows) + 1]] <<- data.frame(      # tabloya bir satır ekle
+    dataset = dataset, way = way, status = status,          # veri seti, yol, durum (OK / FAILED / CACHE)
+    n_features = n_feat, n_columns = n_col, n_sites = n_site,  # gen/prob sayısı, sütun sayısı, laboratuvar sayısı
+    message = substr(gsub("[\r\n]+", " ", msg), 1, 300))    # hata mesajı (kısaltılmış)
+}
+
+bioc_ok <- function(pkg) {                                  # Bioconductor paketi kurulu mu? değilse kurmayı dene
+  if (requireNamespace(pkg, quietly = TRUE)) return(TRUE)   # zaten kuruluysa tamam
+  tryCatch({
+    if (!requireNamespace("BiocManager", quietly = TRUE))   # BiocManager yoksa
+      install.packages("BiocManager")                       #   CRAN'dan kur
+    BiocManager::install(pkg, ask = FALSE, update = FALSE)  # paketi kur (diğer paketleri güncelleme)
+  }, error = function(e) NULL)                              # kurulum hatası olursa sessizce geç
+  requireNamespace(pkg, quietly = TRUE)                     # sonuç: kuruldu mu?
+}
+
+download_tmp <- function(url) {                             # dosyayı geçici klasöre indir (proje klasörünü kirletmez)
+  dest <- file.path(tempdir(), basename(url))               # geçici dosya yolu
+  if (!file.exists(dest)) download.file(url, dest, mode = "wb", quiet = TRUE)  # yoksa indir
+  dest                                                      # dosya yolunu döndür
+}
+
+list_remote_files <- function(dir_url) {                    # GEO klasöründeki dosya adlarını listele
+  html <- readLines(dir_url, warn = FALSE)                  # klasör sayfasını oku
+  m <- regmatches(html, gregexpr('href="[^"?/]+"', html))   # bağlantıları bul
+  unique(gsub('href="|"', "", unlist(m)))                   # yalnızca dosya adlarını döndür
+}
+
+# --- 3b) GEO series matrix dosyasını temel R ile oku (Yol B) ---
+read_series_matrix <- function(gz_file) {
+  L <- readLines(gzfile(gz_file), warn = FALSE)             # tüm satırları oku
+  field <- function(tag) {                                  # "!Sample_xxx" satırından değerleri çek
+    x <- L[startsWith(L, tag)]                              # o etiketle başlayan satırlar
+    if (length(x) == 0) return(NULL)                        # yoksa NULL
+    lapply(x, function(s) gsub('"', "", strsplit(s, "\t")[[1]][-1]))  # her satırı sekmeden böl, tırnakları sil
+  }
+  title <- field("!Sample_title")[[1]]                      # örnek başlıkları
+  gsm   <- field("!Sample_geo_accession")[[1]]              # GSM numaraları
+  ch    <- field("!Sample_characteristics_ch1")             # örnek özellikleri (birden çok satır olabilir)
+  chars <- if (is.null(ch)) rep("", length(gsm)) else       # özellikleri tek metinde birleştir
+    apply(do.call(cbind, ch), 1, paste, collapse = "; ")
+  b <- which(L == "!series_matrix_table_begin")             # veri tablosunun başı
+  e <- which(L == "!series_matrix_table_end")               # veri tablosunun sonu
+  tab <- read.delim(text = L[(b + 1):(e - 1)], check.names = FALSE, quote = '"')  # tabloyu oku
+  X <- as.matrix(tab[, -1, drop = FALSE]); rownames(X) <- tab[[1]]   # ilk sütun prob adı, gerisi ifade değerleri
+  list(expr = X, info = data.frame(sample_id = gsm, title = title, chars = chars))  # ifade matrisi + örnek bilgisi
+}
+
+parse_maqc_titles <- function(info) {                       # başlıktan laboratuvar, örnek (A-D), tekrar çıkar
+  s <- paste(info$title, info$chars)                        # başlık + özellikler
+  m <- regmatches(s, regexec("AFX[_ ]?([0-9]+)[_ ]?([A-D])[_ ]?([0-9]+)", s))  # ör. "AFX_1_A1"
+  get <- function(i) sapply(m, function(z) if (length(z) == 4) z[i] else NA)   # eşleşme yoksa NA
+  data.frame(sample_id = info$sample_id, site = get(2), samp = get(3), repl = get(4))
+}
+
+# --- 3c) MAQC: Yol A (MAQCsubset paketi) ---
+maqc_way_A <- function() {
+  if (!bioc_ok("Biobase") || !bioc_ok("MAQCsubset")) stop("MAQCsubset/Biobase kurulamadı")
+  suppressPackageStartupMessages(library(Biobase))          # ExpressionSet sınıfı için
+  e <- new.env()                                            # verinin yükleneceği boş ortam
+  data("afxsubRMAES", package = "MAQCsubset", envir = e)    # Affymetrix alt kümesi (RMA, 54675 prob x 24 örnek)
+  es <- e$afxsubRMAES                                       # ExpressionSet nesnesi
+  X  <- Biobase::exprs(es)                                  # ifade matrisi
+  pd <- Biobase::pData(es)                                  # örnek bilgileri
+  list(expr = X,
+       pheno = data.frame(sample_id = colnames(X), site = as.character(pd$site),
+                          samp = as.character(pd$samp), repl = as.character(pd$repl)),
+       source = "MAQCsubset::afxsubRMAES (RMA)", way = "A")
+}
+
+# --- 3d) MAQC: Yol B (GEO GSE5350, GPL570 series matrix, temel R) ---
+maqc_way_B <- function() {
+  gz <- tryCatch(download_tmp(url_maqc_B), error = function(e) NULL)  # önce bilinen dosya adını dene
+  if (is.null(gz)) {                                        # olmazsa klasörü listele
+    fl <- list_remote_files(url_maqc_dir)                   # klasördeki dosyalar
+    fl <- fl[grepl("GPL570", fl) & grepl("series_matrix", fl)]  # GPL570 (Affymetrix) matrisi
+    if (length(fl) == 0) stop("GSE5350 içinde GPL570 series matrix bulunamadı")
+    gz <- download_tmp(paste0(url_maqc_dir, fl[1]))         # bulunanı indir
+  }
+  sm <- read_series_matrix(gz)                              # dosyayı oku
+  ph <- parse_maqc_titles(sm$info)                          # laboratuvar/örnek/tekrar çıkar
+  if (all(is.na(ph$site))) {                                # başlıklar beklenen biçimde değilse
+    write.csv(head(sm$info, 30), "step03_maqc_pheno_head.csv", row.names = FALSE)  # bana göndermen için örnek
+    stop("Örnek başlıkları ayrıştırılamadı; step03_maqc_pheno_head.csv dosyasını gönderin")
+  }
+  list(expr = sm$expr, pheno = ph, source = "GEO GSE5350 GPL570 series matrix", way = "B")
+}
+
+# --- 3e) SEQC: Yol A (seqc paketi; Illumina RefSeq gen sayımları + TaqMan) ---
+seqc_way_A <- function() {
+  if (!bioc_ok("seqc")) stop("seqc paketi kurulamadı")
+  objs <- paste0("ILM_refseq_gene_", seqc_sites)            # 6 Illumina merkezinin tablo adları
+  getd <- function(o) tryCatch(getExportedValue("seqc", o), # önce doğrudan eriş
+    error = function(e) { en <- new.env(); data(list = o, package = "seqc", envir = en); en[[o]] })  # olmazsa data()
+  ilm <- setNames(lapply(objs, getd), seqc_sites)           # her merkezin sayım tablosu
+  list(ilm = ilm, taqman = getd("taqman"), source = "Bioconductor seqc (RefSeq gene counts)", way = "A")
+}
+
+# --- 3f) SEQC: Yol B (GEO GSE47774 ek dosyaları, temel R) ---
+seqc_way_B <- function() {
+  fl <- list_remote_files(url_seqc_dir)                     # GEO'daki ek dosyaların listesi
+  write.csv(data.frame(file = fl), "step03_seqc_geo_files.csv", row.names = FALSE)  # listeyi kaydet (kontrol için)
+  fl <- fl[grepl("ILM", fl, ignore.case = TRUE)]            # yalnızca Illumina dosyaları
+  site_of <- sapply(fl, function(f) {                       # dosya adındaki merkez kodunu bul
+    hit <- seqc_sites[sapply(seqc_sites, grepl, x = f)]; if (length(hit)) hit[1] else NA })
+  fl <- fl[!is.na(site_of)]; site_of <- site_of[!is.na(site_of)]  # merkez kodu bulunanları tut
+  if (length(fl) == 0) stop("GSE47774'te Illumina merkez dosyası bulunamadı; step03_seqc_geo_files.csv gönderin")
+  keep <- !duplicated(site_of)                              # her merkezden bir dosya
+  ilm <- lapply(fl[keep], function(f) read.delim(download_tmp(paste0(url_seqc_dir, f)), check.names = FALSE))  # indir+oku
+  names(ilm) <- site_of[keep]
+  list(ilm = ilm, taqman = NULL, source = "GEO GSE47774 supplementary", way = "B")
+}
+
+# --- 3g) Tasarım tabloları ---
+maqc_design <- function(m) {                                # laboratuvar x örnek başına tekrar sayısı
+  ph <- m$pheno[!is.na(m$pheno$site), ]                     # ayrıştırılabilen örnekler
+  d  <- aggregate(sample_id ~ site + samp, data = ph, FUN = length)  # her hücrede kaç tekrar
+  names(d)[3] <- "n_replicates"
+  cbind(source = m$source, way = m$way, n_probes = nrow(m$expr), d)
+}
+
+parse_lib_cols <- function(cn) {                            # "A_1_L01_FlowCellA" -> örnek, tekrar, şerit
+  m <- regmatches(cn, regexec("(?:^|_)([A-F])_([0-9]+)_(L[0-9]+|R[0-9]+)", cn, perl = TRUE))  # desen
+  ok <- sapply(m, length) == 4                              # eşleşen sütunlar = kütüphane sütunları
+  data.frame(col = cn[ok], samp = sapply(m[ok], `[`, 2),
+             repl = sapply(m[ok], `[`, 3), lane = sapply(m[ok], `[`, 4))
+}
+
+seqc_design <- function(s) {                                # her merkez x örnek: kaç bağımsız tekrar, kaç şerit sütunu
+  out <- list()
+  for (site in names(s$ilm)) {
+    tb <- s$ilm[[site]]                                     # o merkezin tablosu
+    pc <- parse_lib_cols(colnames(tb))                      # kütüphane sütunlarını çöz
+    if (nrow(pc) == 0) next                                 # sütun adı beklenmedikse atla
+    is_ercc <- if ("IsERCC" %in% names(tb)) as.logical(tb$IsERCC) else rep(FALSE, nrow(tb))  # spike-in satırları
+    agg <- aggregate(lane ~ samp, data = pc, FUN = length)  # örnek başına şerit sütunu sayısı
+    rep <- aggregate(repl ~ samp, data = pc, FUN = function(z) length(unique(z)))  # örnek başına tekrar sayısı
+    out[[site]] <- data.frame(platform = "Illumina", site = site, samp = agg$samp,
+                              n_replicates = rep$repl, n_lane_columns = agg$lane,
+                              n_genes = sum(!is_ercc), source = s$source, way = s$way)
+  }
+  if (!is.null(s$taqman)) {                                 # TaqMan: "A1_value" sütunları
+    tv <- grep("_value$", colnames(s$taqman), value = TRUE) # değer sütunları
+    sm <- substr(tv, 1, 1)                                  # örnek harfi
+    out[["TaqMan"]] <- data.frame(platform = "TaqMan", site = "TaqMan",
+                                  samp = names(table(sm)), n_replicates = as.vector(table(sm)),
+                                  n_lane_columns = NA, n_genes = nrow(s$taqman),
+                                  source = s$source, way = s$way)
+  }
+  do.call(rbind, out)
+}
+
+# --- 3h) Çalıştır ---
+if (!REDO_STEP03 && all(file.exists(c(f_check, f_mdes, f_sdes)))) {
+  cat("step03 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP03 <- TRUE).\n")
+} else {
+
+  # MAQC: önbellek varsa oradan; yoksa iki yol da denenir (A küçük alt küme, B tam veri), en iyisi saklanır
+  if (file.exists(f_maqc)) {
+    maqc <- readRDS(f_maqc); add_check("MAQC", maqc$way, "CACHE", nrow(maqc$expr), ncol(maqc$expr),
+                                       length(unique(na.omit(maqc$pheno$site))), "önbellekten okundu")
+  } else {
+    mA <- tryCatch(maqc_way_A(), error = function(e) e)     # Yol A
+    if (inherits(mA, "error")) add_check("MAQC", "A", "FAILED", msg = conditionMessage(mA)) else
+      add_check("MAQC", "A", "OK", nrow(mA$expr), ncol(mA$expr), length(unique(mA$pheno$site)))
+    mB <- tryCatch(maqc_way_B(), error = function(e) e)     # Yol B
+    if (inherits(mB, "error")) add_check("MAQC", "B", "FAILED", msg = conditionMessage(mB)) else
+      add_check("MAQC", "B", "OK", nrow(mB$expr), ncol(mB$expr), length(unique(na.omit(mB$pheno$site))))
+    maqc <- if (!inherits(mB, "error")) mB else if (!inherits(mA, "error")) mA else NULL  # tam veri öncelikli
+    if (!is.null(maqc)) saveRDS(maqc, f_maqc)               # bir daha indirmemek için sakla
+  }
+
+  # SEQC: önbellek varsa oradan; yoksa önce Yol A, olmazsa Yol B (dosyalar büyük, iki kez indirmeyelim)
+  if (file.exists(f_seqc)) {
+    seqc <- readRDS(f_seqc); add_check("SEQC", seqc$way, "CACHE", NA, NA, length(seqc$ilm), "önbellekten okundu")
+  } else {
+    seqc <- tryCatch(seqc_way_A(), error = function(e) e)   # Yol A
+    if (inherits(seqc, "error")) {
+      add_check("SEQC", "A", "FAILED", msg = conditionMessage(seqc))
+      seqc <- tryCatch(seqc_way_B(), error = function(e) e) # Yol B
+      if (inherits(seqc, "error")) { add_check("SEQC", "B", "FAILED", msg = conditionMessage(seqc)); seqc <- NULL }
+      else add_check("SEQC", "B", "OK", nrow(seqc$ilm[[1]]), sum(sapply(seqc$ilm, ncol)), length(seqc$ilm))
+    } else add_check("SEQC", "A", "OK", nrow(seqc$ilm[[1]]), sum(sapply(seqc$ilm, ncol)), length(seqc$ilm))
+    if (!is.null(seqc)) saveRDS(seqc, f_seqc)               # bir daha indirmemek için sakla
+  }
+
+  # tabloları yaz
+  write.csv(do.call(rbind, check_rows), f_check, row.names = FALSE)                  # çıktı 1
+  write.csv(if (!is.null(maqc)) maqc_design(maqc) else data.frame(note = "MAQC yüklenemedi"),
+            f_mdes, row.names = FALSE)                                               # çıktı 2
+  sd <- if (!is.null(seqc)) seqc_design(seqc) else NULL
+  write.csv(if (!is.null(sd)) sd else data.frame(note = "SEQC yüklenemedi veya sütun adları çözülemedi"),
+            f_sdes, row.names = FALSE)                                               # çıktı 3
+  print(do.call(rbind, check_rows))                                                  # ekrana özet
+}
+
+
+# ---------------------------------------------------------------------
+# step04: KALİBRASYON + İLK BAKIŞ (gürültü tavanı)
+#  (a) Gerçek veriden sentetik veri parametreleri: her gen için gerçek etki (mu), gürültü (sigma),
+#      laboratuvar etkisi (tau)  -> step05'te sahte laboratuvarlar bunlarla üretilecek
+#  (b) Gerçek veride ilk bakış: laboratuvar içi tavan C, laboratuvarlar arası E, oran rho = E / sqrt(C1*C2)
+# ---------------------------------------------------------------------
+REDO_STEP04 <- FALSE        # TRUE: step04 yeniden hesaplanır (v2 sonuçları mevcut, atlanır)
+K_LIST      <- 100          # liste uzunluğu (ilk 100 gen)
+P_RBO       <- 0.98         # RBO ağırlık parametresi
+M_REP       <- 2            # her listede örnek başına kullanılan tekrar sayısı (laboratuvar içinde 2+2 bölmek için)
+MAX_SPLITS  <- 200          # laboratuvar içi bölme sayısı üst sınırı (az ise hepsi = Yol A, çoksa rastgele = Yol B)
+N_BETWEEN   <- 200          # laboratuvarlar arası rastgele çekiliş sayısı (v2: 60 -> 200, Monte Carlo hatası azalsın)
+RHO_MIN_C   <- 0.10         # rho yalnızca iki tavan da >= 0.10 ise "güvenilir" sayılır (tavan sıfıra yakınsa oran patlar)
+DROP_VENDOR <- TRUE         # SEQC: 5. tekrar satıcı (vendor) tarafından hazırlanmış farklı protokol -> çıkar
+
+f_cal  <- "step04_calibration.csv"                          # çıktı 1: sentetik veri parametreleri (özet)
+f_ceil <- "step04_ceiling_by_lab.csv"                       # çıktı 2: laboratuvar içi tavan C
+f_betw <- "step04_between_labs.csv"                         # çıktı 3: laboratuvar çiftleri: E, C1, C2, rho
+f_par  <- "step04_calib_params.rds"                         # gen düzeyinde parametreler (step05 için)
+
+# --- 4a) Veriyi standart biçime getir: lab -> örnek (A,B,C,D) -> gen x tekrar matrisi (log ölçek) ---
+prep_maqc <- function(m) {
+  ph <- m$pheno; ok <- !is.na(ph$site) & ph$samp %in% c("A", "B", "C", "D")  # ayrıştırılmış A-D örnekleri
+  ph <- ph[ok, ]; X <- m$expr[, match(ph$sample_id, colnames(m$expr)), drop = FALSE]  # sütunları eşleştir
+  X <- matrix(as.numeric(X), nrow(X), dimnames = dimnames(X))  # sayıya çevir
+  if (median(X, na.rm = TRUE) > 20) X <- log2(pmax(X, 1))   # ham sinyal ise log2'ye çevir (RMA zaten log)
+  X <- X[rowSums(is.na(X)) == 0, , drop = FALSE]            # eksik değerli probları at
+  am <- rowMeans(X); X <- X[am > quantile(am, 0.25), , drop = FALSE]  # en düşük ifadeli %25'i at (gürültü)
+  labs <- lapply(sort(unique(ph$site)), function(s)         # her laboratuvar için
+    setNames(lapply(c("A", "B", "C", "D"), function(g) X[, ph$site == s & ph$samp == g, drop = FALSE]),
+             c("A", "B", "C", "D")))                        # örnek başına gen x tekrar matrisi
+  names(labs) <- paste0("lab", sort(unique(ph$site)))
+  labs
+}
+
+prep_seqc <- function(s) {
+  cnt <- list(); key <- NULL
+  for (site in names(s$ilm)) {                              # her merkez için
+    tb <- s$ilm[[site]]
+    if ("IsERCC" %in% names(tb)) tb <- tb[!as.logical(tb$IsERCC), ]  # spike-in satırlarını çıkar
+    pc <- parse_lib_cols(colnames(tb)); pc <- pc[pc$samp %in% c("A", "B", "C", "D"), ]  # A-D kütüphaneleri
+    if (DROP_VENDOR) pc <- pc[pc$repl != "5", ]             # v2: satıcı kütüphanesini (tekrar 5) çıkar -> her merkezde 4 tekrar
+    M  <- as.matrix(tb[, pc$col]); storage.mode(M) <- "double"  # şerit sütunları
+    lib <- paste(pc$samp, pc$repl, sep = "_")               # kütüphane adı = örnek_tekrar
+    Cm <- t(rowsum(t(M), lib))                              # aynı kütüphanenin şeritlerini topla
+    rownames(Cm) <- paste(tb$EntrezID, tb$Symbol)           # gen anahtarı
+    Cm <- Cm[!duplicated(rownames(Cm)), , drop = FALSE]     # tekrarlanan gen adlarından yalnızca ilkini tut
+    cnt[[site]] <- Cm
+    key <- if (is.null(key)) rownames(Cm) else intersect(key, rownames(Cm))  # ortak genler
+  }
+  all <- do.call(cbind, lapply(cnt, function(Cm) Cm[key, , drop = FALSE]))  # tüm kütüphaneler yan yana
+  cpm <- t(t(all) / colSums(all)) * 1e6                     # milyonda okuma (CPM)
+  keep <- rowMeans(cpm) >= 1                                # ortalama CPM >= 1 olan genler (düşük ifadeyi at)
+  labs <- lapply(names(cnt), function(site) {
+    Cm <- cnt[[site]][key[keep], , drop = FALSE]
+    L  <- log2((Cm + 2) / (colSums(cnt[[site]][key, ]) + 4) * 1e6)    # v2: log2-CPM, önsel sayı 2 (edgeR varsayılanına benzer; düşük sayımlı genlerin aşırı LFC gürültüsünü azaltır)
+    smp <- sub("_.*", "", colnames(L))                      # kütüphanenin örnek harfi
+    setNames(lapply(c("A", "B", "C", "D"), function(g) L[, smp == g, drop = FALSE]), c("A", "B", "C", "D"))
+  })
+  names(labs) <- names(cnt)
+  labs
+}
+
+# --- 4b) Gen skorları ve ilk-k listesi ---
+score_fun <- function(xa, xb, ranking) {
+  d <- rowMeans(xa) - rowMeans(xb)                          # log kat değişimi (LFC)
+  if (ranking == "LFC") return(d)                           # sıralama 1: kat değişimi
+  s2 <- (rowSums((xa - rowMeans(xa))^2) + rowSums((xb - rowMeans(xb))^2)) /
+        (ncol(xa) + ncol(xb) - 2)                           # birleştirilmiş varyans
+  d / sqrt((s2 + median(s2)) * (1 / ncol(xa) + 1 / ncol(xb)))  # sıralama 2: düzenlenmiş t (SAM benzeri)
+}
+top_k <- function(sc, k) order(-abs(sc))[1:k]               # mutlak skora göre ilk k gen (sıra numarası)
+
+rbo_lists <- function(L1, L2) rbo_value(L1, L2, K_LIST, P_RBO, "ext", "A")  # RBO_EXT (step01 fonksiyonu)
+
+# --- 4c) Laboratuvar içi tavan C: aynı laboratuvarın ayrık tekrar yarılarından iki liste ---
+disjoint_pairs <- function(n, m, ordered = FALSE) {         # {1..n}'den iki ayrık m'lik küme
+  S <- combn(n, m, simplify = FALSE); out <- list()
+  for (i in seq_along(S)) for (j in seq_along(S)) {
+    if (i == j || length(intersect(S[[i]], S[[j]])) > 0) next  # ayrık değilse atla
+    if (!ordered && j < i) next                             # sırasız ise her çifti bir kez al
+    out[[length(out) + 1]] <- list(S[[i]], S[[j]])
+  }
+  out
+}
+
+ceiling_lab <- function(lab, g1, g2, ranking) {
+  na <- ncol(lab[[g1]]); nb <- ncol(lab[[g2]])
+  if (na < 2 * M_REP || nb < 2 * M_REP) return(c(C = NA, n = 0, way = NA))  # bölmek için yeterli tekrar yok
+  PA <- disjoint_pairs(na, M_REP); PB <- disjoint_pairs(nb, M_REP, ordered = TRUE)
+  grid <- expand.grid(a = seq_along(PA), b = seq_along(PB)) # tüm bölme kombinasyonları
+  way <- "A_all"                                            # Yol A: hepsi
+  if (nrow(grid) > MAX_SPLITS) { grid <- grid[sample(nrow(grid), MAX_SPLITS), ]; way <- "B_sample" }  # Yol B: rastgele
+  r <- apply(grid, 1, function(z) {
+    a <- PA[[z[1]]]; b <- PB[[z[2]]]
+    L1 <- top_k(score_fun(lab[[g1]][, a[[1]], drop = FALSE], lab[[g2]][, b[[1]], drop = FALSE], ranking), K_LIST)
+    L2 <- top_k(score_fun(lab[[g1]][, a[[2]], drop = FALSE], lab[[g2]][, b[[2]], drop = FALSE], ranking), K_LIST)
+    rbo_lists(L1, L2)
+  })
+  c(C = mean(r), se = sd(r) / sqrt(length(r)), n = length(r), way = way)  # ortalama + Monte Carlo standart hatası
+}
+
+# --- 4d) Laboratuvarlar arası E: iki farklı laboratuvardan aynı tekrar sayısıyla listeler ---
+between_labs <- function(lab1, lab2, g1, g2, ranking) {
+  r <- replicate(N_BETWEEN, {
+    a1 <- sample(ncol(lab1[[g1]]), M_REP); b1 <- sample(ncol(lab1[[g2]]), M_REP)  # lab1'den rastgele tekrarlar
+    a2 <- sample(ncol(lab2[[g1]]), M_REP); b2 <- sample(ncol(lab2[[g2]]), M_REP)  # lab2'den rastgele tekrarlar
+    L1 <- top_k(score_fun(lab1[[g1]][, a1, drop = FALSE], lab1[[g2]][, b1, drop = FALSE], ranking), K_LIST)
+    L2 <- top_k(score_fun(lab2[[g1]][, a2, drop = FALSE], lab2[[g2]][, b2, drop = FALSE], ranking), K_LIST)
+    rbo_lists(L1, L2)
+  })
+  c(E = mean(r), se = sd(r) / sqrt(length(r)))                # ortalama + Monte Carlo standart hatası
+}
+
+# --- 4e) Kalibrasyon: gerçek etki mu, gürültü sigma, laboratuvar etkisi tau (gen bazında) ---
+calibrate <- function(labs, g1, g2) {
+  lfc  <- sapply(labs, function(l) rowMeans(l[[g1]]) - rowMeans(l[[g2]]))   # gen x lab: laboratuvar LFC'leri
+  mu   <- rowMeans(lfc)                                     # gerçek etki tahmini (laboratuvarların ortalaması)
+  s2   <- sapply(labs, function(l) (rowSums((l[[g1]] - rowMeans(l[[g1]]))^2) +
+                                    rowSums((l[[g2]] - rowMeans(l[[g2]]))^2)) /
+                                   (ncol(l[[g1]]) + ncol(l[[g2]]) - 2))      # gen x lab: tekrar varyansı
+  sigma <- sqrt(rowMeans(s2))                               # gürültü: tekrarlar arası standart sapma
+  inv  <- mean(sapply(labs, function(l) 1 / ncol(l[[g1]]) + 1 / ncol(l[[g2]])))  # ortalama 1/nA + 1/nB
+  tau2 <- pmax(0, apply(lfc, 1, var) - sigma^2 * inv)       # laboratuvar etkisi: LFC'nin labs arası varyansı - gürültü payı
+  data.frame(gene = rownames(lfc), mu = mu, sigma = sigma, tau = sqrt(tau2))
+}
+
+# --- 4f) Çalıştır ---
+if (!REDO_STEP04 && all(file.exists(c(f_cal, f_ceil, f_betw, f_par)))) {
+  cat("step04 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP04 <- TRUE).\n")
+} else {
+  t4 <- Sys.time(); set.seed(20261026)
+  data_sets <- list()                                       # Yol A: step03 önbelleğinden oku
+  if (file.exists(f_maqc)) data_sets$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) data_sets$SEQC <- prep_seqc(readRDS(f_seqc))
+  if (length(data_sets) == 0) stop("step03 .rds dosyaları yok; önce step03 çalışmalı (REDO_STEP03 <- TRUE)")
+
+  contrasts <- list("A-B" = c("A", "B"), "C-D" = c("C", "D"))  # güçlü fark (A-B) ve zayıf fark (C-D)
+  rankings  <- c("LFC", "modT")                             # iki sıralama yöntemi
+  cal_rows <- list(); ceil_rows <- list(); betw_rows <- list(); par_list <- list()
+
+  for (ds in names(data_sets)) {
+    labs <- data_sets[[ds]]; N_g <- nrow(labs[[1]]$A)       # laboratuvarlar ve gen sayısı
+    floor_rbo <- null_moments_exact(N_g, K_LIST, rbo_weights(K_LIST, P_RBO, "ext"))$mean  # rastgele zemin (Aşama 1)
+    for (cn in names(contrasts)) {
+      g1 <- contrasts[[cn]][1]; g2 <- contrasts[[cn]][2]
+      cat(sprintf("%s %s: kalibrasyon...\n", ds, cn))
+      cp <- calibrate(labs, g1, g2); par_list[[paste(ds, cn)]] <- cp  # gen düzeyinde parametreler
+      reps <- sapply(labs, function(l) min(ncol(l[[g1]]), ncol(l[[g2]])))
+      cal_rows[[length(cal_rows) + 1]] <- data.frame(
+        dataset = ds, contrast = cn, n_genes = N_g, n_labs = length(labs),
+        reps_min = min(reps), reps_max = max(reps),
+        prop_absmu_gt1 = mean(abs(cp$mu) > 1),              # |gerçek LFC| > 1 olan genlerin oranı
+        absmu_q50 = median(abs(cp$mu)), absmu_q90 = quantile(abs(cp$mu), 0.90, names = FALSE),
+        absmu_q99 = quantile(abs(cp$mu), 0.99, names = FALSE),
+        sigma_q50 = median(cp$sigma), sigma_q90 = quantile(cp$sigma, 0.90, names = FALSE),
+        tau_q50 = median(cp$tau), tau_q90 = quantile(cp$tau, 0.90, names = FALSE),
+        prop_tau_pos = mean(cp$tau > 0),                    # laboratuvar etkisi > 0 görünen genlerin oranı
+        floor_rbo = floor_rbo)
+      for (rk in rankings) {
+        cat(sprintf("   %s: tavan ve laboratuvarlar arası...\n", rk))
+        Cl <- lapply(labs, ceiling_lab, g1 = g1, g2 = g2, ranking = rk)  # her laboratuvarın tavanı
+        for (ln in names(labs)) ceil_rows[[length(ceil_rows) + 1]] <- data.frame(
+          dataset = ds, contrast = cn, ranking = rk, lab = ln,
+          C_hat = as.numeric(Cl[[ln]]["C"]), C_se = as.numeric(Cl[[ln]]["se"]), n_splits = as.numeric(Cl[[ln]]["n"]),
+          split_way = Cl[[ln]]["way"], floor_rbo = floor_rbo)
+        pr <- combn(names(labs), 2)                         # tüm laboratuvar çiftleri
+        for (j in seq_len(ncol(pr))) {
+          l1 <- pr[1, j]; l2 <- pr[2, j]
+          E  <- between_labs(labs[[l1]], labs[[l2]], g1, g2, rk)
+          C1 <- as.numeric(Cl[[l1]]["C"]); C2 <- as.numeric(Cl[[l2]]["C"])
+          betw_rows[[length(betw_rows) + 1]] <- data.frame(
+            dataset = ds, contrast = cn, ranking = rk, lab1 = l1, lab2 = l2,
+            E_hat = E[["E"]], E_se = E[["se"]], C1 = C1, C2 = C2,
+            rho_hat = E[["E"]] / sqrt(C1 * C2),                 # rho = 1: laboratuvar etkisi yok
+            rho_reliable = min(C1, C2) >= RHO_MIN_C,            # iki tavan da yeterince yüksek mi?
+            floor_rbo = floor_rbo)
+        }
+      }
+    }
+  }
+  write.csv(do.call(rbind, cal_rows),  f_cal,  row.names = FALSE)   # çıktı 1
+  write.csv(do.call(rbind, ceil_rows), f_ceil, row.names = FALSE)   # çıktı 2
+  write.csv(do.call(rbind, betw_rows), f_betw, row.names = FALSE)   # çıktı 3
+  saveRDS(par_list, f_par)                                          # step05 için gen düzeyinde parametreler
+  cat(sprintf("step04 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t4, units = "mins"))))
+}
+
+
+# ---------------------------------------------------------------------
+# step05: SİMÜLASYON (sahte laboratuvarlar, gerçek veriden kalibre edilmiş)
+#  Her sahte laboratuvar: gen g için A tekrarları = (mu_g + b_g)/2 + gürültü, B tekrarları = -(mu_g + b_g)/2 + gürültü
+#  mu_g, sigma_g, tau_g = step04'te MAQC ve SEQC'den ölçülen değerler
+#  Senaryolar:
+#   S0  laboratuvar etkisi yok (b = 0)                     -> rho_hat 1 civarında mı? ne kadar dağılıyor?
+#   S1  laboratuvar etkisi b ~ N(0, (kappa*sigma_g)^2)      -> rho ne kadar düşüyor? (kappa = 0.25, 0.5, 1)
+#   S1c laboratuvar etkisi b ~ N(0, tau_g^2) (gerçek tau)   -> gerçekçi laboratuvar etkisi
+#   S2  1. laboratuvarda tek aykırı tekrar                  -> rho_hat > 1'in nedeni bu mu?
+#   S3  2. laboratuvar 1.5 kat daha gürültülü, sapma yok    -> gürültü farkı tek başına rho'yu düşürür mü?
+#   S4  sinyal zayıflatılır (mu x 0.5, 0.25, 0.1)           -> tavan küçülünce rho_hat ne kadar güvenilmez?
+#   S5  permütasyon testi (S0 = yanlış alarm, S1 kappa=0.5 = güç)
+# ---------------------------------------------------------------------
+REDO_STEP05 <- FALSE        # TRUE: step05 yeniden hesaplanır
+R_SIM       <- 200          # her senaryoda sahte laboratuvar çifti sayısı
+SIM_SPLITS  <- 30           # sahte laboratuvarda tavan için rastgele bölme sayısı
+SIM_BETWEEN <- 30           # sahte laboratuvarlar arası çekiliş sayısı
+G_KEEP      <- 3000         # hız için: ilk-100'e girme şansı olan en olası 3000 (+3000) gen tutulur
+RUN_S5      <- TRUE         # permütasyon testi simülasyonu (en uzun kısım)
+R_PERM_SIM  <- 60           # permütasyon testi için sahte çift sayısı
+B_PERM      <- 49           # her testte permütasyon sayısı
+
+f_sum  <- "step05_sim_summary.csv"                          # çıktı 1: senaryo özetleri
+f_raw  <- "step05_sim_raw.csv"                              # çıktı 2: tüm tekrarlar (grafikler için)
+f_perm <- "step05_perm_test.csv"                            # çıktı 3: permütasyon testi yanlış alarm ve güç
+
+# --- 5a) Parametreler: Yol A = step04 kalibrasyonu (gerçek veri), Yol B = genel varsayılan parametreler ---
+get_bases <- function() {
+  if (file.exists(f_par)) {                                 # Yol A
+    par <- readRDS(f_par)
+    out <- list(MAQC = par[["MAQC A-B"]], SEQC = par[["SEQC A-B"]])
+    out <- out[!sapply(out, is.null)]
+    if (length(out) > 0) return(list(bases = out, source = "step04 calibration (real data)"))
+  }
+  set.seed(1); G <- 20000                                   # Yol B: kalibrasyon yoksa genel parametreler
+  mu <- rbinom(G, 1, 0.3) * rnorm(G, 0, 2)                  # genlerin %30'u değişiyor
+  list(bases = list(GENERIC = data.frame(gene = paste0("g", 1:G), mu = mu,
+                                         sigma = 0.15, tau = 0.1)),
+       source = "generic default parameters (step04 calibration not found)")
+}
+
+prefilter <- function(cp, m, s0) {                          # ilk-100'e girme şansı olmayan genleri at
+  sd_d <- cp$sigma * sqrt(2 / m)                            # m tekrarla LFC'nin standart sapması
+  opt_lfc <- abs(cp$mu) + 3 * sd_d                          # iyimser LFC skoru
+  opt_t   <- opt_lfc / sqrt((cp$sigma^2 + s0) * (2 / m))    # iyimser düzenlenmiş t skoru
+  keep <- union(order(-opt_lfc)[1:min(G_KEEP, nrow(cp))], order(-opt_t)[1:min(G_KEEP, nrow(cp))])
+  cp[keep, ]
+}
+
+# --- 5b) Sahte laboratuvar üret ---
+sim_lab <- function(cp, n, b_sd = 0, noise = 1, outlier = 0) {
+  G <- nrow(cp)
+  b <- rnorm(G, 0, b_sd)                                    # laboratuvar etkisi (gen bazında)
+  A <- (cp$mu + b) / 2 + noise * cp$sigma * matrix(rnorm(G * n), G)   # A örneği tekrarları
+  B <- -(cp$mu + b) / 2 + noise * cp$sigma * matrix(rnorm(G * n), G)  # B örneği tekrarları
+  if (outlier > 0) A[, 1] <- A[, 1] + outlier * cp$sigma * rnorm(G)   # 1. A tekrarına ek sapma (aykırı tekrar)
+  list(A = A, B = B)
+}
+
+# --- 5c) Skor (step04 ile aynı, düzenlenmiş t'de sabit s0) ---
+score_sim <- function(xa, xb, ranking, s0) {
+  d <- rowMeans(xa) - rowMeans(xb)                          # LFC
+  if (ranking == "LFC") return(d)
+  s2 <- (rowSums((xa - rowMeans(xa))^2) + rowSums((xb - rowMeans(xb))^2)) / (ncol(xa) + ncol(xb) - 2)
+  d / sqrt((s2 + s0) * (1 / ncol(xa) + 1 / ncol(xb)))       # düzenlenmiş t
+}
+list_sim <- function(lab, ia, ib, ranking, s0)              # seçilen tekrarlarla ilk-k listesi
+  top_k(score_sim(lab$A[, ia, drop = FALSE], lab$B[, ib, drop = FALSE], ranking, s0), K_LIST)
+
+# --- 5d) Bir laboratuvar çifti için C1, C2, E, rho ---
+rho_pair <- function(l1, l2, ranking, s0, n_spl = SIM_SPLITS, n_btw = SIM_BETWEEN) {
+  ceil1 <- function(lab) mean(replicate(n_spl, {            # laboratuvar içi: rastgele ayrık 2+2 bölme
+    ia <- sample(ncol(lab$A)); ib <- sample(ncol(lab$B))
+    rbo_lists(list_sim(lab, ia[1:M_REP], ib[1:M_REP], ranking, s0),
+              list_sim(lab, ia[M_REP + 1:M_REP], ib[M_REP + 1:M_REP], ranking, s0))
+  }))
+  C1 <- ceil1(l1); C2 <- ceil1(l2)
+  E <- mean(replicate(n_btw,                                # laboratuvarlar arası: rastgele 2'şer tekrar
+    rbo_lists(list_sim(l1, sample(ncol(l1$A), M_REP), sample(ncol(l1$B), M_REP), ranking, s0),
+              list_sim(l2, sample(ncol(l2$A), M_REP), sample(ncol(l2$B), M_REP), ranking, s0))))
+  c(C1 = C1, C2 = C2, E = E, rho = E / sqrt(C1 * C2))
+}
+
+# --- 5e) Permütasyon testi: H0 = tekrarlar laboratuvarlar arasında değiştirilebilir (laboratuvar etkisi yok) ---
+perm_test <- function(l1, l2, ranking, s0) {
+  obs <- rho_pair(l1, l2, ranking, s0, 20, 20)[["rho"]]     # gözlenen rho (daha az bölme ile, hız için)
+  n1 <- ncol(l1$A); pA <- cbind(l1$A, l2$A); pB <- cbind(l1$B, l2$B)  # tekrarları havuzla
+  perm <- replicate(B_PERM, {
+    ia <- sample(ncol(pA)); ib <- sample(ncol(pB))          # tekrarları rastgele iki sahte laboratuvara dağıt
+    rho_pair(list(A = pA[, ia[1:n1], drop = FALSE], B = pB[, ib[1:n1], drop = FALSE]),
+             list(A = pA[, ia[-(1:n1)], drop = FALSE], B = pB[, ib[-(1:n1)], drop = FALSE]),
+             ranking, s0, 20, 20)[["rho"]]
+  })
+  (1 + sum(perm <= obs)) / (B_PERM + 1)                     # tek yönlü p: laboratuvar etkisi rho'yu düşürür
+}
+
+# --- 5f) Senaryo tablosu ---
+scen <- rbind(
+  data.frame(scenario = "S0",  level = "none",       kappa = 0,    use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 1,    rk = "LFC,modT"),
+  data.frame(scenario = "S1",  level = "kappa=0.25", kappa = 0.25, use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 1,    rk = "LFC"),
+  data.frame(scenario = "S1",  level = "kappa=0.5",  kappa = 0.5,  use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 1,    rk = "LFC"),
+  data.frame(scenario = "S1",  level = "kappa=1",    kappa = 1,    use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 1,    rk = "LFC"),
+  data.frame(scenario = "S1c", level = "tau_g",      kappa = NA,   use_tau = TRUE,  outlier = 0, noise2 = 1,   mu_scale = 1,    rk = "LFC"),
+  data.frame(scenario = "S2",  level = "outlier=2",  kappa = 0,    use_tau = FALSE, outlier = 2, noise2 = 1,   mu_scale = 1,    rk = "LFC,modT"),
+  data.frame(scenario = "S3",  level = "noise2=1.5", kappa = 0,    use_tau = FALSE, outlier = 0, noise2 = 1.5, mu_scale = 1,    rk = "LFC"),
+  data.frame(scenario = "S4",  level = "mu x0.5",    kappa = 0,    use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 0.5,  rk = "LFC"),
+  data.frame(scenario = "S4",  level = "mu x0.25",   kappa = 0,    use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 0.25, rk = "LFC"),
+  data.frame(scenario = "S4",  level = "mu x0.1",    kappa = 0,    use_tau = FALSE, outlier = 0, noise2 = 1,   mu_scale = 0.1,  rk = "LFC"))
+n_rep_of <- c(MAQC = 5, SEQC = 4, GENERIC = 4)              # gerçek veri tasarımındaki tekrar sayısı
+
+# --- 5g) Çalıştır ---
+if (!REDO_STEP05 && all(file.exists(c(f_sum, f_raw)))) {
+  cat("step05 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP05 <- TRUE).\n")
+} else {
+  t5 <- Sys.time(); set.seed(20261027)
+  gb <- get_bases(); cat("step05 parametre kaynağı:", gb$source, "\n")
+  raw <- list()
+  for (bn in names(gb$bases)) {
+    cp0 <- gb$bases[[bn]]; s0 <- median(cp0$sigma^2)        # düzenlenmiş t için sabit (tüm genlerden)
+    cp0 <- prefilter(cp0, M_REP, s0)                        # hız için gen filtresi
+    n <- n_rep_of[[bn]]
+    for (i in seq_len(nrow(scen))) {
+      sc <- scen[i, ]; rks <- strsplit(sc$rk, ",")[[1]]
+      cat(sprintf("%s %s %s ...\n", bn, sc$scenario, sc$level))
+      cp <- cp0; cp$mu <- cp$mu * sc$mu_scale               # S4: sinyali zayıflat
+      bsd <- if (sc$use_tau) cp$tau else sc$kappa * cp$sigma  # laboratuvar etkisinin standart sapması
+      for (r in seq_len(R_SIM)) {
+        l1 <- sim_lab(cp, n, bsd, 1, sc$outlier)            # sahte laboratuvar 1
+        l2 <- sim_lab(cp, n, bsd, sc$noise2, 0)             # sahte laboratuvar 2
+        for (rk in rks) {
+          v <- rho_pair(l1, l2, rk, s0)
+          raw[[length(raw) + 1]] <- data.frame(base = bn, scenario = sc$scenario, level = sc$level,
+                                               ranking = rk, rep = r, C1 = v[["C1"]], C2 = v[["C2"]],
+                                               E = v[["E"]], rho = v[["rho"]])
+        }
+      }
+    }
+  }
+  raw <- do.call(rbind, raw)
+  raw$param_source <- gb$source
+  write.csv(raw, f_raw, row.names = FALSE)                  # çıktı 2
+
+  q <- function(x, p) quantile(x, p, names = FALSE, na.rm = TRUE)
+  key <- unique(raw[, c("base", "scenario", "level", "ranking")])
+  smry <- do.call(rbind, lapply(seq_len(nrow(key)), function(j) {
+    d <- merge(raw, key[j, ])
+    data.frame(key[j, ], n_rep = nrow(d), mean_C = mean(c(d$C1, d$C2)), mean_E = mean(d$E),
+               mean_rho = mean(d$rho), sd_rho = sd(d$rho), q025_rho = q(d$rho, 0.025),
+               q975_rho = q(d$rho, 0.975), prop_rho_gt1 = mean(d$rho > 1),
+               param_source = gb$source)
+  }))
+  write.csv(smry, f_sum, row.names = FALSE)                 # çıktı 1
+  print(smry[, c("base", "scenario", "level", "ranking", "mean_C", "mean_rho", "sd_rho", "prop_rho_gt1")], digits = 3)
+
+  if (RUN_S5) {                                             # S5: permütasyon testi
+    prow <- list()
+    for (bn in names(gb$bases)) {
+      cp <- gb$bases[[bn]]; s0 <- median(cp$sigma^2); cp <- prefilter(cp, M_REP, s0); n <- n_rep_of[[bn]]
+      for (kap in c(0, 0.5)) {                              # 0 = yanlış alarm, 0.5 = güç
+        cat(sprintf("S5 permütasyon testi: %s kappa=%.1f ...\n", bn, kap))
+        pv <- replicate(R_PERM_SIM, {
+          l1 <- sim_lab(cp, n, kap * cp$sigma); l2 <- sim_lab(cp, n, kap * cp$sigma)
+          perm_test(l1, l2, "LFC", s0)
+        })
+        prow[[length(prow) + 1]] <- data.frame(base = bn, kappa = kap, n_rep = R_PERM_SIM, B_perm = B_PERM,
+                                               reject_05 = mean(pv <= 0.05), reject_10 = mean(pv <= 0.10),
+                                               param_source = gb$source)
+      }
+    }
+    write.csv(do.call(rbind, prow), f_perm, row.names = FALSE)  # çıktı 3
+    print(do.call(rbind, prow))
+  }
+  cat(sprintf("step05 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t5, units = "mins"))))
+}
+
+
+# ---------------------------------------------------------------------
+# step06: GERÇEK VERİDE ÇIKARIM
+#  (a) Her gerçek laboratuvar çifti için permütasyon testi: H0 = laboratuvar etkisi yok
+#      (tekrarlar iki laboratuvar arasında rastgele karıştırılır, rho yeniden hesaplanır)
+#  (b) Kalibrasyon eğrileri: sahte laboratuvarlarda kappa = 0 ... 3 için rho_hat dağılımı
+#  (c) Her çift için kappa tahmini ve %95 güven aralığı (test ters çevirme):
+#      gözlenen rho_hat'i "olağan" kılan kappa değerleri = güven aralığı
+#  Güvenilirlik: iki tavan da >= 0.20 değilse test yapılmaz (step05 S4 sonucu)
+# ---------------------------------------------------------------------
+REDO_STEP06  <- FALSE       # TRUE: step06 yeniden hesaplanır
+RHO_MIN_C6   <- 0.20        # güvenilirlik eşiği (step05 S4'e göre 0.10 -> 0.20)
+B_PERM_REAL  <- 99          # gerçek çiftlerde permütasyon sayısı (p-değeri çözünürlüğü 0.01)
+SPL_REAL     <- 30          # gerçek çiftlerde tavan için bölme sayısı
+BTW_REAL     <- 30          # gerçek çiftlerde laboratuvarlar arası çekiliş sayısı
+G_KEEP_REAL  <- 5000        # hız için gerçek veride tutulan gen sayısı (her sıralama için)
+KAPPA_GRID   <- c(0, 0.25, 0.5, 0.75, 1, 1.5, 2, 3)  # kalibrasyon eğrisi için kappa değerleri
+R_CURVE      <- 150         # her kappa için sahte çift sayısı
+RUN_S5_BIG   <- FALSE       # TRUE: permütasyon testinin 500 tekrarlı büyük simülasyonu (çok uzun; gece çalıştırın)
+
+f_pairs  <- "step06_real_pairs.csv"                         # çıktı 1: gerçek çiftler: rho, p, kappa, güven aralığı
+f_curves <- "step06_kappa_curves.csv"                       # çıktı 2: kalibrasyon eğrileri
+f_fchk   <- "step06_filter_check.csv"                       # çıktı 3: gen filtresi kontrolü
+f_big    <- "step06_perm_sim_big.csv"                       # (isteğe bağlı) büyük S5 simülasyonu
+
+configs6 <- data.frame(                                     # analiz edilecek veri x karşılaştırma x sıralama
+  dataset  = c("MAQC", "MAQC", "MAQC", "SEQC", "SEQC"),
+  contrast = c("A-B",  "A-B",  "C-D",  "A-B",  "A-B"),
+  ranking  = c("LFC",  "modT", "LFC",  "LFC",  "modT"))     # SEQC C-D ve MAQC C-D modT: tavanlar çok düşük, çıkarıldı
+
+# --- 6a) Gerçek veri için gen filtresi (ilk-100'e girme şansı olmayanları at) ---
+prefilter_real <- function(labs, g1, g2, s0) {
+  opt <- sapply(labs, function(l) {                         # her laboratuvarda iyimser skor
+    d  <- abs(rowMeans(l[[g1]]) - rowMeans(l[[g2]]))        # tüm tekrarlarla LFC
+    s2 <- (rowSums((l[[g1]] - rowMeans(l[[g1]]))^2) + rowSums((l[[g2]] - rowMeans(l[[g2]]))^2)) /
+          (ncol(l[[g1]]) + ncol(l[[g2]]) - 2)
+    cbind(lfc = d + 3 * sqrt(s2 * 2 / M_REP),               # LFC için iyimser
+          t   = (d + 3 * sqrt(s2 * 2 / M_REP)) / sqrt((s2 + s0) * 2 / M_REP))  # düzenlenmiş t için iyimser
+  }, simplify = "array")                                    # gen x 2 x lab
+  ol <- apply(opt[, 1, , drop = FALSE], 1, max); ot <- apply(opt[, 2, , drop = FALSE], 1, max)  # laboratuvarlar üzerinden en büyük
+  K <- min(G_KEEP_REAL, length(ol))
+  sort(union(order(-ol)[1:K], order(-ot)[1:K]))             # tutulacak genlerin sıra numaraları
+}
+sub_lab <- function(l, g1, g2, keep) list(A = l[[g1]][keep, , drop = FALSE], B = l[[g2]][keep, , drop = FALSE])
+
+# --- 6b) Gerçek çift için permütasyon testi ---
+perm_test_real <- function(l1, l2, ranking, s0) {
+  obs <- rho_pair(l1, l2, ranking, s0, SPL_REAL, BTW_REAL)  # gözlenen C1, C2, E, rho
+  if (min(obs[["C1"]], obs[["C2"]]) < RHO_MIN_C6) return(c(obs, p = NA))  # güvenilmezse test yapma
+  n1 <- ncol(l1$A); m1 <- ncol(l1$B)
+  pA <- cbind(l1$A, l2$A); pB <- cbind(l1$B, l2$B)          # tekrarları havuzla
+  perm <- replicate(B_PERM_REAL, {
+    ia <- sample(ncol(pA)); ib <- sample(ncol(pB))          # tekrarları rastgele iki sahte laboratuvara dağıt
+    rho_pair(list(A = pA[, ia[1:n1], drop = FALSE], B = pB[, ib[1:m1], drop = FALSE]),
+             list(A = pA[, ia[-(1:n1)], drop = FALSE], B = pB[, ib[-(1:m1)], drop = FALSE]),
+             ranking, s0, SPL_REAL, BTW_REAL)[["rho"]]
+  })
+  c(obs, p = (1 + sum(perm <= obs[["rho"]])) / (B_PERM_REAL + 1))  # tek yönlü p
+}
+
+# --- 6c) Kalibrasyon eğrisinden kappa tahmini ve güven aralığı (test ters çevirme) ---
+kappa_ci <- function(obs, cv) {                             # cv: bir yapılandırmanın eğrisi (kappa, mean, q025, q975)
+  cv <- cv[order(cv$kappa), ]
+  mn <- cummin(cv$mean_rho)                                 # ortalama rho kappa ile azalır (monoton yap)
+  fine <- seq(min(cv$kappa), max(cv$kappa), by = 0.01)      # ince kappa ızgarası
+  mf <- approx(cv$kappa, mn, fine)$y; lo <- approx(cv$kappa, cv$q025_rho, fine)$y; hi <- approx(cv$kappa, cv$q975_rho, fine)$y
+  acc <- fine[lo <= obs & obs <= hi]                        # gözlenen değeri olağan kılan kappa'lar
+  k_hat <- if (obs >= mf[1]) 0 else if (obs < min(mf)) NA else fine[which(mf <= obs)[1]]  # nokta tahmini
+  k_lo <- if (length(acc)) min(acc) else NA; k_hi <- if (length(acc)) max(acc) else NA
+  rho_at <- function(k) if (is.na(k)) NA else min(1, approx(fine, mf, k)$y)  # o kappa'daki gerçek rho
+  c(kappa_hat = k_hat, kappa_lo = k_lo, kappa_hi = k_hi,
+    kappa_beyond_grid = obs < min(lo, na.rm = TRUE),        # gözlenen rho, kappa=3'te bile beklenenden düşük mü
+    rho_lo = rho_at(k_hi), rho_hi = rho_at(k_lo))
+}
+
+# --- 6d) Çalıştır ---
+if (!REDO_STEP06 && all(file.exists(c(f_pairs, f_curves)))) {
+  cat("step06 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP06 <- TRUE).\n")
+} else {
+  t6 <- Sys.time(); set.seed(20261028)
+  par6 <- if (file.exists(f_par)) readRDS(f_par) else stop("step04_calib_params.rds yok; önce step04 çalışmalı")
+  ds6 <- list()                                             # gerçek veriyi hazırla (step04 fonksiyonları)
+  if (file.exists(f_maqc)) ds6$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds6$SEQC <- prep_seqc(readRDS(f_seqc))
+  ctr <- list("A-B" = c("A", "B"), "C-D" = c("C", "D"))
+
+  # (b) kalibrasyon eğrileri
+  curves <- list()
+  for (i in seq_len(nrow(configs6))) {
+    cf <- configs6[i, ]; cp <- par6[[paste(cf$dataset, cf$contrast)]]
+    if (is.null(cp) || is.null(ds6[[cf$dataset]])) next
+    s0 <- median(cp$sigma^2); cpf <- prefilter(cp, M_REP, s0); n <- n_rep_of[[cf$dataset]]
+    for (kap in KAPPA_GRID) {
+      cat(sprintf("eğri: %s %s %s kappa=%.2f\n", cf$dataset, cf$contrast, cf$ranking, kap))
+      v <- replicate(R_CURVE, rho_pair(sim_lab(cpf, n, kap * cpf$sigma), sim_lab(cpf, n, kap * cpf$sigma),
+                                       cf$ranking, s0, SPL_REAL, BTW_REAL))
+      curves[[length(curves) + 1]] <- data.frame(cf, kappa = kap, n_rep = R_CURVE,
+        mean_C = mean(c(v["C1", ], v["C2", ])), mean_rho = mean(v["rho", ]), sd_rho = sd(v["rho", ]),
+        q025_rho = quantile(v["rho", ], 0.025, names = FALSE), q975_rho = quantile(v["rho", ], 0.975, names = FALSE))
+    }
+  }
+  curves <- do.call(rbind, curves); write.csv(curves, f_curves, row.names = FALSE)   # çıktı 2
+
+  # (a) + (c) gerçek çiftler
+  rows <- list(); fchk <- list()
+  for (i in seq_len(nrow(configs6))) {
+    cf <- configs6[i, ]; labs <- ds6[[cf$dataset]]; if (is.null(labs)) next
+    g1 <- ctr[[cf$contrast]][1]; g2 <- ctr[[cf$contrast]][2]
+    s0 <- median(par6[[paste(cf$dataset, cf$contrast)]]$sigma^2)  # düzenlenmiş t sabiti (tüm genlerden)
+    keep <- prefilter_real(labs, g1, g2, s0)
+    # gen filtresi kontrolü: ilk çift, aynı rastgele sayılarla, tüm genler vs filtrelenmiş genler
+    l1f <- sub_lab(labs[[1]], g1, g2, seq_len(nrow(labs[[1]][[g1]]))); l2f <- sub_lab(labs[[2]], g1, g2, seq_len(nrow(labs[[2]][[g1]])))
+    set.seed(99); full <- rho_pair(l1f, l2f, cf$ranking, s0, SPL_REAL, BTW_REAL)
+    set.seed(99); filt <- rho_pair(sub_lab(labs[[1]], g1, g2, keep), sub_lab(labs[[2]], g1, g2, keep), cf$ranking, s0, SPL_REAL, BTW_REAL)
+    fchk[[length(fchk) + 1]] <- data.frame(cf, n_genes_full = nrow(l1f$A), n_genes_kept = length(keep),
+                                           rho_full = full[["rho"]], rho_filtered = filt[["rho"]],
+                                           C1_full = full[["C1"]], C1_filtered = filt[["C1"]])
+    cv <- curves[curves$dataset == cf$dataset & curves$contrast == cf$contrast & curves$ranking == cf$ranking, ]
+    pr <- combn(names(labs), 2)
+    for (j in seq_len(ncol(pr))) {
+      cat(sprintf("permütasyon testi: %s %s %s %s-%s\n", cf$dataset, cf$contrast, cf$ranking, pr[1, j], pr[2, j]))
+      v  <- perm_test_real(sub_lab(labs[[pr[1, j]]], g1, g2, keep), sub_lab(labs[[pr[2, j]]], g1, g2, keep), cf$ranking, s0)
+      rel <- min(v[["C1"]], v[["C2"]]) >= RHO_MIN_C6
+      kc <- if (rel && nrow(cv) > 0) kappa_ci(v[["rho"]], cv) else
+        c(kappa_hat = NA, kappa_lo = NA, kappa_hi = NA, kappa_beyond_grid = NA, rho_lo = NA, rho_hi = NA)
+      rows[[length(rows) + 1]] <- data.frame(cf, lab1 = pr[1, j], lab2 = pr[2, j],
+        C1 = v[["C1"]], C2 = v[["C2"]], E = v[["E"]], rho_hat = v[["rho"]], reliable = rel,
+        p_perm = v[["p"]], t(kc))
+    }
+  }
+  res <- do.call(rbind, rows)
+  res$p_bh <- ave(res$p_perm, res$dataset, res$contrast, res$ranking,
+                  FUN = function(p) p.adjust(p, method = "BH"))   # çoklu test düzeltmesi (Benjamini-Hochberg)
+  write.csv(res, f_pairs, row.names = FALSE)                       # çıktı 1
+  write.csv(do.call(rbind, fchk), f_fchk, row.names = FALSE)       # çıktı 3
+  print(res[, c("dataset", "contrast", "ranking", "lab1", "lab2", "rho_hat", "p_perm", "p_bh", "kappa_hat")], digits = 3)
+  cat(sprintf("step06 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t6, units = "mins"))))
+}
+
+# --- 6e) (isteğe bağlı) büyük S5: permütasyon testinin yanlış alarm ve gücü, 500 tekrar ---
+if (RUN_S5_BIG && (REDO_STEP06 || !file.exists(f_big))) {
+  gb <- get_bases(); big <- list(); set.seed(20261029)
+  for (bn in names(gb$bases)) {
+    cp <- gb$bases[[bn]]; s0 <- median(cp$sigma^2); cp <- prefilter(cp, M_REP, s0); n <- n_rep_of[[bn]]
+    for (kap in c(0, 0.25, 0.5)) {
+      cat(sprintf("büyük S5: %s kappa=%.2f\n", bn, kap))
+      pv <- replicate(500, perm_test(sim_lab(cp, n, kap * cp$sigma), sim_lab(cp, n, kap * cp$sigma), "LFC", s0))
+      big[[length(big) + 1]] <- data.frame(base = bn, kappa = kap, n_rep = 500, B_perm = B_PERM,
+                                           reject_05 = mean(pv <= 0.05), reject_10 = mean(pv <= 0.10))
+    }
+  }
+  write.csv(do.call(rbind, big), f_big, row.names = FALSE)
+}
+
+
+# ---------------------------------------------------------------------
+# step07: GENEL VE LABORATUVAR BAZINDA PERMÜTASYON TESTİ + İKİ PARTİLİ TEKRAR KONTROLÜ
+#  (a) Genel test: H0 = hiçbir laboratuvar etkisi yok. İstatistik: 15 çiftin ortalama rho_hat'i.
+#      Permütasyon: tüm laboratuvarların tekrarları havuzlanır, aynı sayılarla laboratuvarlara rastgele dağıtılır.
+#  (b) Laboratuvar bazında: lab l için istatistik = [l'yi içeren çiftlerin ortalama rho'su] - [l'yi içermeyen çiftlerin ortalama rho'su]
+#      (negatif = lab l diğerlerinden farklı). Aynı permütasyonlar kullanılır; 6 p-değerine BH düzeltmesi.
+#  (c) S2b simülasyonu: bir laboratuvarın tekrarları iki partiye ayrılırsa rho_hat 1'in üstüne çıkar mı?
+#  (d) Gerçek veri: laboratuvar içi tekrar kalıntılarının korelasyonu (iki parti var mı?)
+# ---------------------------------------------------------------------
+REDO_STEP07 <- FALSE        # TRUE: step07 yeniden hesaplanır
+B_GLOBAL    <- 499          # permütasyon sayısı (en küçük p = 0.002)
+SPL7        <- 30           # laboratuvar içi bölme sayısı
+BTW7        <- 30           # laboratuvar başına liste havuzu (laboratuvarlar arası E için)
+R_S2B       <- 150          # S2b simülasyon tekrar sayısı
+
+f_glob <- "step07_global_tests.csv"                         # çıktı 1: genel test
+f_labt <- "step07_lab_tests.csv"                            # çıktı 2: laboratuvar bazında testler
+f_s2b  <- "step07_s2b_batch_sim.csv"                        # çıktı 3: iki partili tekrar simülasyonu
+f_rcor <- "step07_replicate_cor.csv"                        # çıktı 4: laboratuvar içi tekrar korelasyonları
+
+configs7 <- data.frame(dataset = c("MAQC", "MAQC", "SEQC"), contrast = c("A-B", "C-D", "A-B"),
+                       ranking = c("LFC", "LFC", "LFC"))    # yalnızca LFC (modT laboratuvar etkisine duyarsız, step06)
+
+# --- 7a) Tüm laboratuvarlar için istatistikler (listeler laboratuvar başına bir kez üretilir) ---
+lab_lists <- function(lab, ranking, s0) {
+  C <- mean(replicate(SPL7, {                               # laboratuvar içi tavan: ayrık 2+2 bölmeler
+    ia <- sample(ncol(lab$A)); ib <- sample(ncol(lab$B))
+    rbo_lists(list_sim(lab, ia[1:M_REP], ib[1:M_REP], ranking, s0),
+              list_sim(lab, ia[M_REP + 1:M_REP], ib[M_REP + 1:M_REP], ranking, s0))
+  }))
+  pool <- replicate(BTW7, list_sim(lab, sample(ncol(lab$A), M_REP), sample(ncol(lab$B), M_REP), ranking, s0),
+                    simplify = FALSE)                       # laboratuvarlar arası karşılaştırma için liste havuzu
+  list(C = C, pool = pool)
+}
+
+all_stats <- function(labs, ranking, s0) {
+  ll <- lapply(labs, lab_lists, ranking = ranking, s0 = s0) # her laboratuvarın tavanı ve liste havuzu
+  L <- length(labs); Cv <- sapply(ll, `[[`, "C")
+  R <- matrix(NA, L, L, dimnames = list(names(labs), names(labs)))
+  for (i in 1:(L - 1)) for (j in (i + 1):L) {               # her çift için E ve rho
+    E <- mean(mapply(rbo_lists, ll[[i]]$pool, ll[[j]]$pool))
+    R[i, j] <- R[j, i] <- E / sqrt(Cv[i] * Cv[j])
+  }
+  glob <- mean(R[upper.tri(R)])                             # genel istatistik: ortalama rho
+  labst <- sapply(1:L, function(l) {                        # laboratuvar istatistiği: kendi çiftleri - diğer çiftler
+    Ro <- R[-l, -l, drop = FALSE]
+    mean(R[l, -l]) - mean(Ro[upper.tri(Ro)])
+  })
+  list(glob = glob, lab = setNames(labst, names(labs)), C = Cv, R = R)
+}
+
+permute_labs <- function(labs) {                            # tekrarları laboratuvarlar arasında rastgele dağıt
+  nA <- sapply(labs, function(l) ncol(l$A)); nB <- sapply(labs, function(l) ncol(l$B))
+  PA <- do.call(cbind, lapply(labs, `[[`, "A")); PB <- do.call(cbind, lapply(labs, `[[`, "B"))
+  gA <- split(sample(ncol(PA)), rep(seq_along(labs), nA)); gB <- split(sample(ncol(PB)), rep(seq_along(labs), nB))
+  setNames(lapply(seq_along(labs), function(i) list(A = PA[, gA[[i]], drop = FALSE], B = PB[, gB[[i]], drop = FALSE])),
+           names(labs))
+}
+
+# --- 7b) S2b: iki partili tekrarlı sahte laboratuvar ---
+sim_lab_batch <- function(cp, n, beta) {
+  lab <- sim_lab(cp, n)                                     # normal sahte laboratuvar
+  bt <- rep(1:2, c(ceiling(n / 2), floor(n / 2)))           # tekrarları iki partiye böl (4 -> 2+2, 5 -> 3+2)
+  for (b in 1:2) {                                          # her parti için A ve B'ye ayrı parti etkisi ekle
+    lab$A[, bt == b] <- lab$A[, bt == b] + beta * cp$sigma * rnorm(nrow(cp))
+    lab$B[, bt == b] <- lab$B[, bt == b] + beta * cp$sigma * rnorm(nrow(cp))
+  }
+  lab
+}
+
+# --- 7c) Laboratuvar içi tekrar kalıntılarının korelasyonu ---
+rep_cor <- function(X) {                                    # X: gen x tekrar (log ölçek)
+  Rz <- X - rowMeans(X)                                     # her genin laboratuvar ortalamasından sapması
+  Rz <- Rz[apply(Rz, 1, sd) > 0, , drop = FALSE]
+  cor(Rz)                                                   # tekrarlar arası korelasyon (eşit tekrarlarda hepsi ≈ -1/(n-1))
+}
+
+# --- 7d) Çalıştır ---
+if (!REDO_STEP07 && all(file.exists(c(f_glob, f_labt, f_s2b, f_rcor)))) {
+  cat("step07 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP07 <- TRUE).\n")
+} else {
+  t7 <- Sys.time(); set.seed(20261030)
+  par7 <- readRDS(f_par)
+  ds7 <- list()
+  if (file.exists(f_maqc)) ds7$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds7$SEQC <- prep_seqc(readRDS(f_seqc))
+  ctr <- list("A-B" = c("A", "B"), "C-D" = c("C", "D"))
+
+  # (d) tekrar korelasyonları (hızlı, önce)
+  rc <- list()
+  for (dn in names(ds7)) for (ln in names(ds7[[dn]])) for (g in c("A", "B")) {
+    M <- rep_cor(ds7[[dn]][[ln]][[g]]); n <- ncol(M)
+    for (i in 1:(n - 1)) for (j in (i + 1):n)
+      rc[[length(rc) + 1]] <- data.frame(dataset = dn, lab = ln, sample = g, rep_i = colnames(M)[i],
+                                         rep_j = colnames(M)[j], r = M[i, j], r_expected = -1 / (n - 1))
+  }
+  write.csv(do.call(rbind, rc), f_rcor, row.names = FALSE)  # çıktı 4
+
+  # (c) S2b simülasyonu
+  s2 <- list()
+  for (bn in c("MAQC", "SEQC")) {
+    cp <- par7[[paste(bn, "A-B")]]; if (is.null(cp)) next
+    s0 <- median(cp$sigma^2); cp <- prefilter(cp, M_REP, s0); n <- n_rep_of[[bn]]
+    for (beta in c(0, 0.5, 1)) {
+      cat(sprintf("S2b: %s beta=%.1f\n", bn, beta))
+      v <- replicate(R_S2B, rho_pair(sim_lab_batch(cp, n, beta), sim_lab(cp, n), "LFC", s0, SPL7, BTW7))
+      s2[[length(s2) + 1]] <- data.frame(base = bn, beta = beta, n_rep = R_S2B,
+        mean_C_batchlab = mean(v["C1", ]), mean_C_normallab = mean(v["C2", ]),
+        mean_rho = mean(v["rho", ]), q025_rho = quantile(v["rho", ], 0.025, names = FALSE),
+        q975_rho = quantile(v["rho", ], 0.975, names = FALSE), prop_rho_gt1 = mean(v["rho", ] > 1))
+    }
+  }
+  write.csv(do.call(rbind, s2), f_s2b, row.names = FALSE)   # çıktı 3
+
+  # (a) + (b) genel ve laboratuvar bazında permütasyon testleri
+  gl <- list(); lt <- list()
+  for (i in seq_len(nrow(configs7))) {
+    cf <- configs7[i, ]; labs0 <- ds7[[cf$dataset]]; if (is.null(labs0)) next
+    g1 <- ctr[[cf$contrast]][1]; g2 <- ctr[[cf$contrast]][2]
+    s0 <- median(par7[[paste(cf$dataset, cf$contrast)]]$sigma^2)
+    keep <- prefilter_real(labs0, g1, g2, s0)               # step06 gen filtresi (doğrulanmış)
+    labs <- lapply(labs0, sub_lab, g1 = g1, g2 = g2, keep = keep)
+    cat(sprintf("genel test: %s %s %s (%d permütasyon)...\n", cf$dataset, cf$contrast, cf$ranking, B_GLOBAL))
+    obs <- all_stats(labs, cf$ranking, s0)                  # gözlenen istatistikler
+    perm <- replicate(B_GLOBAL, { st <- all_stats(permute_labs(labs), cf$ranking, s0); c(st$glob, st$lab) })
+    pg <- (1 + sum(perm[1, ] <= obs$glob)) / (B_GLOBAL + 1) # genel p (tek yönlü: etki rho'yu düşürür)
+    gl[[length(gl) + 1]] <- data.frame(cf, n_labs = length(labs), T_obs = obs$glob,
+      T_perm_mean = mean(perm[1, ]), T_perm_q05 = quantile(perm[1, ], 0.05, names = FALSE),
+      p_global = pg, B = B_GLOBAL)
+    pl <- sapply(seq_along(labs), function(l) (1 + sum(perm[1 + l, ] <= obs$lab[l])) / (B_GLOBAL + 1))
+    lt[[length(lt) + 1]] <- data.frame(cf, lab = names(labs), C = obs$C,
+      mean_rho_with_others = sapply(seq_along(labs), function(l) mean(obs$R[l, -l])),
+      stat = obs$lab, perm_mean = rowMeans(perm[-1, , drop = FALSE]),
+      p_lab = pl, p_lab_bh = p.adjust(pl, method = "BH"), row.names = NULL)
+  }
+  write.csv(do.call(rbind, gl), f_glob, row.names = FALSE)  # çıktı 1
+  write.csv(do.call(rbind, lt), f_labt, row.names = FALSE)  # çıktı 2
+  print(do.call(rbind, gl), digits = 3); print(do.call(rbind, lt), digits = 3); print(do.call(rbind, s2), digits = 3)
+  cat(sprintf("step07 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t7, units = "mins"))))
+}
+
+
+# ---------------------------------------------------------------------
+# step08: PARTİ TEŞHİSİ + PARTİYE DUYARLI RHO + DIŞARIDA BIRAKMA TESTLERİ
+#  (a) Her laboratuvarda tekrarları en iyi ayıran iki parti bulunur (tekrar kalıntı korelasyonlarından).
+#      Kural (önceden sabit): A'da ve B'de skor >= 0.5 VE A ile B'de aynı bölünme -> "ortak parti yapısı var"
+#  (b) Parti yapısı olan laboratuvarda dengeli bölme: her listeye her partiden birer tekrar (parti etkisi götürülür)
+#  (c) Genel test, bir (veya iki) laboratuvar dışarıda bırakılarak tekrarlanır: etki hangi laboratuvardan geliyor?
+# ---------------------------------------------------------------------
+REDO_STEP08 <- FALSE        # TRUE: step08 yeniden hesaplanır
+BATCH_MIN   <- 0.5          # parti skoru eşiği (önceden sabit)
+B_LOO       <- 199          # dışarıda bırakma testlerinde permütasyon sayısı
+SPL8        <- 30           # bölme sayısı
+BTW8        <- 30           # liste havuzu
+
+f_bdiag <- "step08_batch_diag.csv"                          # çıktı 1: parti teşhisi
+f_bpair <- "step08_batch_aware_pairs.csv"                   # çıktı 2: standart vs partiye duyarlı rho
+f_loo   <- "step08_leave_out_tests.csv"                     # çıktı 3: dışarıda bırakma testleri
+
+# --- 8a) En iyi iki-parti bölünmesi ---
+best_partition <- function(M) {                             # M: tekrar korelasyon matrisi
+  n <- ncol(M); best <- -Inf; bg <- NULL
+  for (g1 in combn(n, floor(n / 2), simplify = FALSE)) {    # tüm (n/2, n - n/2) bölünmeler
+    g <- rep(2, n); g[g1] <- 1
+    w <- outer(g, g, "=="); diag(w) <- NA
+    sc <- mean(M[which(w)]) - mean(M[which(!w)])            # parti içi ort. korelasyon - partiler arası
+    if (sc > best) { best <- sc; bg <- g }
+  }
+  list(score = best, g = bg)
+}
+same_part <- function(a, b) length(a) == length(b) && (all(a == b) || all(a == 3 - b))  # etiket değişimine duyarsız
+
+# --- 8b) Partiye duyarlı liste üretimi ---
+lab_lists_batch <- function(lab, ranking, s0) {
+  iA <- split(seq_len(ncol(lab$A)), lab$bA); iB <- split(seq_len(ncol(lab$B)), lab$bB)  # partilere göre tekrarlar
+  pick1 <- function(v) v[sample.int(length(v), 1)]          # bir partiden rastgele bir tekrar
+  half2 <- function(idx) { s <- lapply(idx, function(v) v[sample.int(length(v), 2)])    # her partiden iki farklı tekrar
+                           list(sapply(s, `[`, 1), sapply(s, `[`, 2)) }                 # 1. yarı / 2. yarı
+  C <- mean(replicate(SPL8, { ha <- half2(iA); hb <- half2(iB)
+    rbo_lists(list_sim(lab, ha[[1]], hb[[1]], ranking, s0), list_sim(lab, ha[[2]], hb[[2]], ranking, s0)) }))
+  pool <- replicate(BTW8, list_sim(lab, sapply(iA, pick1), sapply(iB, pick1), ranking, s0), simplify = FALSE)
+  list(C = C, pool = pool)
+}
+
+global_p <- function(labs, ranking, s0, B) {                # genel test (step07 ile aynı istatistik)
+  obs <- all_stats(labs, ranking, s0)$glob
+  perm <- replicate(B, all_stats(permute_labs(labs), ranking, s0)$glob)
+  c(T_obs = obs, T_perm_mean = mean(perm), p = (1 + sum(perm <= obs)) / (B + 1))
+}
+
+# --- 8c) Çalıştır ---
+if (!REDO_STEP08 && all(file.exists(c(f_bdiag, f_bpair, f_loo)))) {
+  cat("step08 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP08 <- TRUE).\n")
+} else {
+  t8 <- Sys.time(); set.seed(20261031)
+  par8 <- readRDS(f_par)
+  ds8 <- list()
+  if (file.exists(f_maqc)) ds8$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds8$SEQC <- prep_seqc(readRDS(f_seqc))
+  ctr <- list("A-B" = c("A", "B"), "C-D" = c("C", "D"))
+
+  # (a) parti teşhisi (A-B karşılaştırmasının örnekleri)
+  bd <- list(); flags <- list()
+  for (dn in names(ds8)) for (ln in names(ds8[[dn]])) {
+    pa <- best_partition(rep_cor(ds8[[dn]][[ln]]$A)); pb <- best_partition(rep_cor(ds8[[dn]][[ln]]$B))
+    fl <- pa$score >= BATCH_MIN && pb$score >= BATCH_MIN && same_part(pa$g, pb$g)
+    bd[[length(bd) + 1]] <- data.frame(dataset = dn, lab = ln, score_A = pa$score, part_A = paste(pa$g, collapse = ""),
+                                       score_B = pb$score, part_B = paste(pb$g, collapse = ""),
+                                       same_partition = same_part(pa$g, pb$g), batch_flag = fl)
+    if (fl) flags[[paste(dn, ln)]] <- list(bA = pa$g, bB = pb$g)
+  }
+  write.csv(do.call(rbind, bd), f_bdiag, row.names = FALSE)                  # çıktı 1
+
+  # (b) parti yapısı olan laboratuvarların çiftleri: standart vs partiye duyarlı rho (A-B, LFC)
+  bp <- list()
+  for (key in names(flags)) {
+    dn <- sub(" .*", "", key); ln <- sub("^[^ ]+ ", "", key); labs0 <- ds8[[dn]]
+    s0 <- median(par8[[paste(dn, "A-B")]]$sigma^2); keep <- prefilter_real(labs0, "A", "B", s0)
+    labs <- lapply(labs0, sub_lab, g1 = "A", g2 = "B", keep = keep)
+    lf <- labs[[ln]]; lf$bA <- flags[[key]]$bA; lf$bB <- flags[[key]]$bB
+    Ls <- lab_lists(lf, "LFC", s0); Lb <- lab_lists_batch(lf, "LFC", s0)       # standart ve partiye duyarlı
+    for (o in setdiff(names(labs), ln)) {
+      Lo <- lab_lists(labs[[o]], "LFC", s0)
+      Es <- mean(mapply(rbo_lists, Ls$pool, Lo$pool)); Eb <- mean(mapply(rbo_lists, Lb$pool, Lo$pool))
+      bp[[length(bp) + 1]] <- data.frame(dataset = dn, batch_lab = ln, other_lab = o, C_other = Lo$C,
+        C_standard = Ls$C, E_standard = Es, rho_standard = Es / sqrt(Ls$C * Lo$C),
+        C_batch_aware = Lb$C, E_batch_aware = Eb, rho_batch_aware = Eb / sqrt(Lb$C * Lo$C))
+    }
+  }
+  write.csv(if (length(bp)) do.call(rbind, bp) else data.frame(note = "parti yapısı olan laboratuvar yok"),
+            f_bpair, row.names = FALSE)                                      # çıktı 2
+
+  # (c) dışarıda bırakma testleri (LFC)
+  loo_plan <- list(list(dataset = "MAQC", contrast = "A-B", drops = c(as.list(names(ds8$MAQC)), list(c("lab1", "lab6")))),
+                   list(dataset = "MAQC", contrast = "C-D", drops = c(as.list(names(ds8$MAQC)), list(c("lab1", "lab6")))),
+                   list(dataset = "SEQC", contrast = "A-B", drops = list("MAY")))
+  lo <- list()
+  for (pl in loo_plan) {
+    labs0 <- ds8[[pl$dataset]]; if (is.null(labs0)) next
+    g1 <- ctr[[pl$contrast]][1]; g2 <- ctr[[pl$contrast]][2]
+    s0 <- median(par8[[paste(pl$dataset, pl$contrast)]]$sigma^2); keep <- prefilter_real(labs0, g1, g2, s0)
+    labs <- lapply(labs0, sub_lab, g1 = g1, g2 = g2, keep = keep)
+    for (dr in pl$drops) {
+      dr <- intersect(dr, names(labs)); if (!length(dr)) next
+      cat(sprintf("dışarıda bırakma: %s %s - %s ...\n", pl$dataset, pl$contrast, paste(dr, collapse = "+")))
+      v <- global_p(labs[setdiff(names(labs), dr)], "LFC", s0, B_LOO)
+      lo[[length(lo) + 1]] <- data.frame(dataset = pl$dataset, contrast = pl$contrast, ranking = "LFC",
+        left_out = paste(dr, collapse = "+"), n_labs = length(labs) - length(dr),
+        T_obs = v[["T_obs"]], T_perm_mean = v[["T_perm_mean"]], p_global = v[["p"]], B = B_LOO)
+    }
+  }
+  write.csv(do.call(rbind, lo), f_loo, row.names = FALSE)                    # çıktı 3
+  print(do.call(rbind, bd), digits = 3); if (length(bp)) print(do.call(rbind, bp), digits = 3); print(do.call(rbind, lo), digits = 3)
+  cat(sprintf("step08 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t8, units = "mins"))))
+}
+
+
+# ---------------------------------------------------------------------
+# step09: ŞEKİLLER VE TABLOLAR (yeni hesaplama yok; önceki CSV'lerden çizim)
+#  Şekiller: rbo_genomics/figures klasörü, her biri 1600 dpi PNG + PDF, İngilizce, başlıksız
+#   Fig1: simülasyon — laboratuvar etkisi (kappa) arttıkça rho nasıl düşüyor (ortalama + %95 aralık)
+#   Fig2: gerçek veri — zemin / laboratuvar içi tavan C / laboratuvarlar arası uyum E (log ölçek)
+#   Fig3: gerçek veri — çift başına rho ve H0 (kappa = 0) aralığı
+#   Fig4: tekrar korelasyon matrisleri — (a) MAY, (b) COH (renk ölçeği sağda)
+#   Fig5: MAY çiftlerinde rastgele bölme vs partiye dengeli bölme rho
+#  Tablolar: step09_table1_design.csv, step09_table2_tests.csv (rbo_genomics klasöründe)
+# ---------------------------------------------------------------------
+REDO_STEP09 <- FALSE        # şekiller tamamlandı; TRUE yaparsan yeniden çizilir
+FIG_DPI     <- 1600         # PNG çözünürlüğü
+fig_dir     <- file.path(base_dir, "figures")               # şekil klasörü
+if (!dir.exists(fig_dir)) dir.create(fig_dir)               # yoksa oluştur
+
+f_t1 <- "step09_table1_design.csv"                          # tablo 1: veri tasarımı + simülasyon gerçekçilik kontrolü
+f_t2 <- "step09_table2_tests.csv"                           # tablo 2: genel ve dışarıda bırakma testleri
+
+col_ds <- c("MAQC A vs B" = "#0072B2", "MAQC C vs D" = "#D55E00", "SEQC A vs B" = "#009E73")  # renk körü dostu palet
+cfg_label <- function(ds, ct) paste(ds, sub("-", " vs ", ct))   # "MAQC A-B" -> "MAQC A vs B"
+
+# --- 9a) Şekil kaydetme: Yol A = cairo cihazları, Yol B = standart cihazlar ---
+save_fig <- function(name, w, h, plot_fun) {
+  fp <- file.path(fig_dir, paste0(name, ".png")); fd <- file.path(fig_dir, paste0(name, ".pdf"))
+  ok_png <- tryCatch({ png(fp, width = w, height = h, units = "in", res = FIG_DPI, type = "cairo")   # Yol A
+                       plot_fun(); dev.off(); TRUE },
+                     error = function(e) { try(dev.off(), silent = TRUE); FALSE })
+  if (!ok_png) { png(fp, width = w, height = h, units = "in", res = FIG_DPI); plot_fun(); dev.off() }  # Yol B
+  ok_pdf <- tryCatch({ cairo_pdf(fd, width = w, height = h); plot_fun(); dev.off(); TRUE },        # Yol A
+                     error = function(e) { try(dev.off(), silent = TRUE); FALSE })
+  if (!ok_pdf) { pdf(fd, width = w, height = h); plot_fun(); dev.off() }                         # Yol B
+  cat("kaydedildi:", fp, "ve", fd, "\n")
+}
+alpha_col <- function(col, a) adjustcolor(col, alpha.f = a) # şeffaf renk
+panel_tag <- function(tag) mtext(tag, side = 3, at = grconvertX(0.01, "nfc", "user"), adj = 0, line = 0.4, font = 2, cex = 0.9)  # (a), (b) etiketi: panelin sol üst köşesi (kesilmez)
+
+# --- 9b) Fig1: kalibrasyon eğrileri ---
+fig1 <- function(cv) function() {
+  par(mar = c(4.2, 4.6, 0.8, 0.8), mgp = c(2.6, 0.7, 0), las = 1, cex = 0.85)
+  plot(NA, xlim = range(cv$kappa), ylim = c(0, max(1.12, cv$q975_rho, na.rm = TRUE)), xlab = expression("Laboratory effect " * kappa * " (in units of replicate SD)"),
+       ylab = expression("Estimated " * rho * " (mean and 95% range)"), bty = "l")
+  abline(h = 1, lty = 2, col = "grey40")
+  for (nm in names(col_ds)) {
+    d <- cv[cv$label == nm, ]; d <- d[order(d$kappa), ]; if (!nrow(d)) next
+    polygon(c(d$kappa, rev(d$kappa)), c(d$q025_rho, rev(d$q975_rho)), col = alpha_col(col_ds[nm], 0.18), border = NA)
+    lines(d$kappa, d$mean_rho, col = col_ds[nm], lwd = 2); points(d$kappa, d$mean_rho, col = col_ds[nm], pch = 19, cex = 0.8)
+  }
+  legend("bottomleft", legend = names(col_ds), col = col_ds, lwd = 2, pch = 19, bty = "n", cex = 0.9)
+}
+
+# --- 9c) Ortak yardımcı: tek panelli şekil + sağda ayrı açıklama (legend) sütunu ---
+#  Çizim alanı solda, açıklama sağdaki kendi sütununda: veriyle hiçbir zaman üst üste gelmez
+with_side_legend <- function(leg_text, plot_part, legend_part) {
+  w_in <- max(sapply(leg_text, function(t) strwidth(t, units = "inches", cex = 0.85))) + 0.6  # en uzun yazı + simge payı (inç)
+  layout(matrix(1:2, 1), widths = c(1, lcm(w_in * 2.54)))  # sol: grafik, sağ: yazıya göre genişlikte açıklama sütunu
+  plot_part()                                               # grafik
+  par(mar = c(0, 0, 0, 0)); plot.new()                      # boş alan
+  legend_part()                                             # açıklama
+}
+
+# --- 9d) Fig2: zemin / tavan / uyum merdiveni ---
+leg2 <- c("Within-laboratory ceiling C", "Between-laboratory agreement E", "Random-ranking floor")   # açıklama yazıları
+fig2 <- function(rp, floors) function() {
+  labs_x <- names(col_ds); xs <- seq_along(labs_x)
+  with_side_legend(leg2, function() {
+    par(mar = c(3.0, 4.6, 0.8, 0.6), mgp = c(3.0, 0.7, 0), las = 1, cex = 0.9, lend = 2)
+    plot(NA, xlim = c(0.5, length(xs) + 0.5), ylim = c(7e-4, 1.3), log = "y", xaxt = "n", yaxt = "n", xlab = "",
+         ylab = "Rank-biased overlap (log scale)", bty = "l")
+    axis(2, at = c(0.001, 0.01, 0.1, 1), labels = c("0.001", "0.01", "0.1", "1"))   # okunur log ekseni
+    axis(1, at = xs, labels = FALSE); mtext(labs_x, side = 1, at = xs, line = 0.8, cex = 0.9 * par("cex"))  # tüm etiketler görünsün
+    for (i in xs) {
+      d <- rp[rp$label == labs_x[i], ]; if (!nrow(d)) next
+      Cl <- tapply(c(d$C1, d$C2), c(d$lab1, d$lab2), mean)  # laboratuvar başına tavan
+      points(i - 0.15 + runif(length(Cl), -0.05, 0.05), Cl, pch = 19, col = col_ds[labs_x[i]], cex = 0.85)
+      points(i + 0.15 + runif(nrow(d), -0.05, 0.05), d$E, pch = 2, col = col_ds[labs_x[i]], cex = 0.75)
+      segments(i - 0.3, floors[labs_x[i]], i + 0.3, floors[labs_x[i]], lwd = 2, col = "grey30")
+    }
+  }, function() {
+    legend("left", legend = leg2,
+           pch = c(19, 2, NA), lty = c(NA, NA, 1), lwd = c(NA, NA, 2), col = c("grey20", "grey20", "grey30"),
+           seg.len = 1.6, y.intersp = 1.6, bty = "n", cex = 0.85)
+  })
+}
+
+# --- 9e) Fig3: çift başına rho ---
+leg3 <- c(expression("Null 95% range (" * kappa * " = 0)"), "Pairs with MAQC lab 1/6 or SEQC MAY", "Other pairs")
+fig3 <- function(rp, nullband) function() {
+  labs_x <- names(col_ds); xs <- seq_along(labs_x); rr <- rp[rp$reliable, ]
+  with_side_legend(leg3, function() {
+    par(mar = c(3.0, 4.6, 0.8, 0.6), mgp = c(2.8, 0.7, 0), las = 1, cex = 0.9)
+    plot(NA, xlim = c(0.5, length(xs) + 0.5), ylim = range(c(0, 1.2, rr$rho_hat), na.rm = TRUE), xaxt = "n", xlab = "",
+         ylab = expression(hat(rho) == E / sqrt(C[1] * C[2])), bty = "l")
+    axis(1, at = xs, labels = FALSE); mtext(labs_x, side = 1, at = xs, line = 0.8, cex = 0.9 * par("cex"))  # tüm etiketler görünsün
+    for (i in xs) {
+      nb <- nullband[nullband$label == labs_x[i], ]
+      if (nrow(nb)) rect(i - 0.35, nb$q025_rho, i + 0.35, nb$q975_rho, col = "grey88", border = NA)
+      d <- rr[rr$label == labs_x[i], ]; if (!nrow(d)) next
+      hl <- d$lab1 %in% c("lab1", "lab6") | d$lab2 %in% c("lab1", "lab6") | d$lab1 == "MAY" | d$lab2 == "MAY"
+      points(i + runif(nrow(d), -0.2, 0.2), d$rho_hat, pch = ifelse(hl, 17, 19), col = ifelse(hl, "black", col_ds[labs_x[i]]), cex = 0.85)
+    }
+    abline(h = 1, lty = 2, col = "grey40"); box(bty = "l")
+  }, function() {
+    legend("left", legend = leg3,
+           pch = c(15, 17, 19), col = c("grey80", "black", "grey50"), pt.cex = c(1.6, 0.85, 0.85), y.intersp = 1.6, bty = "n", cex = 0.85)
+  })
+}
+
+# --- 9f) Fig4: tekrar korelasyon matrisleri (MAY ve COH) ---
+cor_matrix <- function(rc, ds, lab, smp) {                  # uzun tablodan korelasyon matrisi
+  d <- rc[rc$dataset == ds & rc$lab == lab & rc$sample == smp, ]
+  reps <- sort(unique(c(d$rep_i, d$rep_j))); n <- length(reps)
+  M <- matrix(NA, n, n, dimnames = list(reps, reps))        # köşegen boş (her zaman 1 olduğu için gösterilmez)
+  for (k in seq_len(nrow(d))) M[as.character(d$rep_i[k]), as.character(d$rep_j[k])] <-
+    M[as.character(d$rep_j[k]), as.character(d$rep_i[k])] <- d$r[k]
+  M
+}
+heat_pal <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(101)   # mavi (-1) - beyaz (0) - kırmızı (+1)
+heat <- function(M, xlab) {                                 # hücreler tek tek çizilir, tüm çizgiler aynı kalınlıkta siyah
+  n <- ncol(M); LW <- 0.9                                   # tek çizgi kalınlığı
+  plot(NA, xlim = c(0.5, n + 0.5), ylim = c(0.5, n + 0.5), xaxs = "i", yaxs = "i", axes = FALSE,
+       xlab = xlab, ylab = "Replicate")
+  for (i in 1:n) for (j in 1:n) {                           # i = sütun (x), j = satır (yukarıdan aşağı)
+    y <- n + 1 - j
+    fill <- if (i == j) "grey85" else heat_pal[round((M[j, i] + 1) * 50) + 1]   # köşegen gri
+    rect(i - 0.5, y - 0.5, i + 0.5, y + 0.5, col = fill, border = NA)
+    if (i != j) text(i, y, sprintf("%.2f", M[j, i]), cex = 0.95, font = 2,      # KALIN sayılar
+                     col = ifelse(abs(M[j, i]) > 0.6, "white", "black"))
+  }
+  segments(1.5:(n - 0.5), 0.5, 1.5:(n - 0.5), n + 0.5, lwd = LW)   # iç dikey çizgiler
+  segments(0.5, 1.5:(n - 0.5), n + 0.5, 1.5:(n - 0.5), lwd = LW)   # iç yatay çizgiler
+  rect(0.5, 0.5, n + 0.5, n + 0.5, lwd = LW, border = "black")     # dış çerçeve (aynı kalınlık)
+  axis(1, at = 1:n, labels = 1:n, tick = FALSE, line = -0.4)       # çizgisiz eksen (çerçeveyle çakışmasın)
+  axis(2, at = 1:n, labels = n:1, tick = FALSE, line = -0.4)
+}
+color_bar <- function() {                                   # sağda dikey renk ölçeği
+  par(mar = c(4.0, 0.6, 1.8, 3.2), las = 1)
+  plot(NA, xlim = c(0, 1), ylim = c(-1, 1), xaxs = "i", yaxs = "i", axes = FALSE, xlab = "", ylab = "")
+  yb <- seq(-1, 1, length.out = 102)
+  rect(0, yb[-102], 1, yb[-1], col = heat_pal, border = NA) # renk şeridi
+  rect(0, -1, 1, 1, lwd = 0.9)                              # çerçeve
+  axis(4, at = c(-1, -0.5, 0, 0.5, 1), labels = c("-1", "-0.5", "0", "0.5", "1"), cex.axis = 0.85)
+  mtext("Correlation", side = 4, line = 2.2, las = 0, cex = 0.8)
+}
+fig4 <- function(rc) function() {
+  layout(matrix(1:3, 1), widths = c(1, 1, lcm(2.2)))       # iki kare ısı haritası + renk ölçeği
+  par(mar = c(4.0, 4.0, 1.8, 0.8), mgp = c(2.4, 0.7, 0), las = 1, cex = 0.85, ljoin = 1, lend = 2, pty = "s")
+  heat(cor_matrix(rc, "SEQC", "MAY", "A"), "Replicate (MAY, sample A)"); panel_tag("(a)")
+  heat(cor_matrix(rc, "SEQC", "COH", "A"), "Replicate (COH, sample A)"); panel_tag("(b)")
+  par(pty = "m"); color_bar()
+}
+
+# --- 9g) Fig5: MAY çiftlerinde rastgele vs partiye dengeli bölme ---
+leg5 <- c("Random split", "Batch-balanced split", expression("Null 95% range (" * kappa * " = 0)"))
+fig5 <- function(bp, nullband) function() {
+  k <- nrow(bp); xs <- seq_len(k)
+  with_side_legend(leg5, function() {
+    par(mar = c(3.6, 4.6, 0.8, 0.6), mgp = c(2.4, 0.7, 0), las = 1, cex = 0.9)
+    plot(NA, xlim = c(0.5, k + 0.5), ylim = range(c(0.9, 1.15, bp$rho_standard, bp$rho_batch_aware, nullband$q025_rho)), xaxt = "n",
+         xlab = "Partner site (paired with MAY)", ylab = expression(hat(rho)), bty = "l")
+    axis(1, at = xs, labels = FALSE); mtext(bp$other_lab, side = 1, at = xs, line = 0.8, cex = par("cex"))  # tüm etiketler görünsün
+    if (nrow(nullband)) rect(0.5, nullband$q025_rho, k + 0.5, nullband$q975_rho, col = "grey90", border = NA)
+    abline(h = 1, lty = 2, col = "grey40")
+    segments(xs, bp$rho_standard, xs, bp$rho_batch_aware, col = "grey60")
+    points(xs, bp$rho_standard, pch = 1, cex = 1.1); points(xs, bp$rho_batch_aware, pch = 19, col = "#009E73", cex = 1.1)
+    box(bty = "l")                                          # bant eksen çizgisini örtmesin
+  }, function() {
+    legend("left", legend = leg5,
+           pch = c(1, 19, 15), col = c("black", "#009E73", "grey85"), pt.cex = c(1.1, 1.1, 1.6), y.intersp = 1.6, bty = "n", cex = 0.85)
+  })
+}
+
+# --- 9h) Çalıştır ---
+need9 <- c(f_curves, f_pairs, f_cal, f_rcor, f_bpair, f_glob, f_loo, f_sdes, f_mdes)
+if (!REDO_STEP09 && all(file.exists(file.path(fig_dir, paste0(rep(paste0("Fig", 1:5), each = 2), c(".png", ".pdf")))))) {
+  cat("step09 şekilleri mevcut, atlanıyor.\n")
+} else if (!all(file.exists(need9))) {
+  cat("step09 için eksik dosyalar:", need9[!file.exists(need9)], "\n")
+} else {
+  set.seed(9)                                               # noktaların yatay dağılımı her seferinde aynı olsun
+  cv <- read.csv(f_curves); cv$label <- cfg_label(cv$dataset, cv$contrast); cv <- cv[cv$ranking == "LFC", ]
+  rp <- read.csv(f_pairs);  rp$label <- cfg_label(rp$dataset, rp$contrast); rp <- rp[rp$ranking == "LFC", ]
+  cal <- read.csv(f_cal);   floors <- setNames(cal$floor_rbo, cfg_label(cal$dataset, cal$contrast))
+  nullband <- cv[cv$kappa == 0, c("label", "q025_rho", "q975_rho")]
+  rc <- read.csv(f_rcor); bp <- read.csv(f_bpair)
+
+  save_fig("Fig1", 5.0, 4.0, fig1(cv))
+  save_fig("Fig2", 6.8, 3.8, fig2(rp, floors))                 # tek panel: merdiven
+  save_fig("Fig3", 7.2, 3.8, fig3(rp, nullband))               # tek panel: çift başına rho
+  save_fig("Fig4", 7.2, 3.4, fig4(rc))                         # iki ısı haritası + renk ölçeği
+  if ("rho_standard" %in% names(bp)) save_fig("Fig5", 6.5, 3.6, fig5(bp, nullband[nullband$label == "SEQC A vs B", ]))
+
+  # Tablo 1: veri tasarımı + simülasyon gerçekçilik kontrolü (LFC, A vs B ve C vs D)
+  md <- read.csv(f_mdes); sdz <- read.csv(f_sdes); sdz <- sdz[sdz$platform == "Illumina" & sdz$samp %in% c("A", "B", "C", "D"), ]
+  t1 <- do.call(rbind, lapply(split(rp, rp$label), function(d) {
+    Cl <- tapply(c(d$C1, d$C2), c(d$lab1, d$lab2), mean); nm <- d$label[1]; ds <- d$dataset[1]
+    reps <- if (ds == "MAQC") range(md$n_replicates) else range(pmin(sdz$n_replicates, 4))  # SEQC: satıcı kütüphanesi hariç 4
+    data.frame(Configuration = nm, Platform = ifelse(ds == "MAQC", "Affymetrix HG-U133 Plus 2.0", "Illumina HiSeq 2000"),
+               Laboratories = length(Cl), Replicates_per_lab = paste(unique(reps), collapse = "-"),
+               Genes_after_filter = cal$n_genes[cfg_label(cal$dataset, cal$contrast) == nm][1],
+               Floor = signif(floors[nm], 2),
+               Ceiling_C_range = sprintf("%.2f-%.2f", min(Cl), max(Cl)),
+               Simulated_C_kappa0 = round(cv$mean_C[cv$label == nm & cv$kappa == 0], 2))
+  }))
+  write.csv(t1, f_t1, row.names = FALSE)
+
+  # Tablo 2: genel testler + dışarıda bırakma
+  gl <- read.csv(f_glob); lo <- read.csv(f_loo)
+  t2 <- rbind(data.frame(Configuration = cfg_label(gl$dataset, gl$contrast), Laboratories_excluded = "none",
+                         Laboratories = gl$n_labs, Mean_rho_observed = round(gl$T_obs, 3),
+                         Mean_rho_permutation = round(gl$T_perm_mean, 3), p_value = gl$p_global, Permutations = gl$B),
+              data.frame(Configuration = cfg_label(lo$dataset, lo$contrast), Laboratories_excluded = lo$left_out,
+                         Laboratories = lo$n_labs, Mean_rho_observed = round(lo$T_obs, 3),
+                         Mean_rho_permutation = round(lo$T_perm_mean, 3), p_value = lo$p_global, Permutations = lo$B))
+  t2 <- t2[order(t2$Configuration, t2$Laboratories_excluded != "none"), ]
+  write.csv(t2, f_t2, row.names = FALSE)
+  print(t1); print(t2)
+}
+
+cat("Gönderilecek dosyalar:", f_t1, f_t2, "+ figures klasöründeki Fig1.png ... Fig5.png\n")  # kullanıcıya hatırlatma
+
+
+# ---------------------------------------------------------------------
+# step10: HAKEM ÖNERİLERİNE YANIT — EK ANALİZLER (tek seferde, her parça kendi CSV'sine yazar)
+#  10a  Null dağılımı: ızgara (20.000 hücre) ne kadar hata yapıyor? Küçük k'da tam sayım ile karşılaştırma,
+#       büyük N'de 20.000 vs 80.000 hücre karşılaştırması                               (saniyeler)
+#  10b  Gerçek veride genel testler B = 1999 permütasyonla (p çözünürlüğü 0.0005)          (en uzun gerçek-veri işi)
+#  10c  k ve p duyarlılığı: (k, p) = (50, .98), (200, .98), (100, .90), (100, .95)         (orta)
+#  10d  Genel testin simülasyonu: I. tip hata ve güç; eşit olmayan gürültü, gen korelasyonu,
+#       4 laboratuvar, iki laboratuvarda etki                                            (en uzun; paralel)
+#  10e  Parti (batch) teşhisi simülasyonu: yanlış alarm, yakalama gücü, rho_hat şişmesi ve düzeltme
+#  10f  Diğer ölçütlerle karşılaştırma: ham RBO, ilk-100 örtüşme, Spearman, IDR, rho_hat
+#  Her parça çıktısı varsa atlanır; yarıda kalırsa yeniden çalıştırınca kaldığı yerden devam eder.
+# ---------------------------------------------------------------------
+REDO_STEP10 <- FALSE        # TRUE: step10 çıktıları silinmeden yeniden hesaplanır
+N_CORES     <- max(1, parallel::detectCores() - 1)   # Yol A: paralel çekirdek sayısı (Yol B: seri)
+B_FINAL     <- 1999         # 10b permütasyon sayısı
+B_SENS      <- 199          # 10c permütasyon sayısı
+R_GLOB      <- 100          # 10d senaryo başına simülasyon (paralel); seri çalışırsa R_GLOB_SER
+R_GLOB_SER  <- 40
+B_GLOB_SIM  <- 49           # 10d her simülasyonda permütasyon sayısı
+SPL10       <- 15           # 10d/10e hız için bölme sayısı
+BTW10       <- 15           # 10d/10e hız için liste havuzu
+R_BATCH     <- 300          # 10e parti teşhisi tekrar sayısı (yalnızca korelasyon; hızlı)
+R_BATCH_RHO <- 100          # 10e rho_hat tekrar sayısı (paralel)
+
+f10a <- "step10a_null_grid_check.csv"
+f10b <- "step10b_global_tests_B1999.csv"
+f10c <- "step10c_kp_sensitivity.csv"
+f10d <- "step10d_global_test_sim.csv"
+f10e <- "step10e_batch_sim.csv"
+f10f <- "step10f_compare_pairs.csv"
+f10g <- "step10f_compare_labs.csv"
+need10 <- function(f) REDO_STEP10 || !file.exists(f)       # bu parça hesaplanmalı mı?
+
+# --- 10.0) Paralel yardımcı: Yol A = parallel kümesi (Windows'ta da çalışır), Yol B = seri ---
+run_reps <- function(n, fun, n_serial = n) {
+  out <- NULL
+  if (N_CORES > 1) out <- tryCatch({
+    cl <- parallel::makeCluster(N_CORES)                    # çekirdek kümesi aç
+    on.exit(parallel::stopCluster(cl), add = TRUE)          # iş bitince kapat
+    vars <- Filter(function(v) { o <- get(v, envir = globalenv())
+                                 is.function(o) || as.numeric(object.size(o)) < 5e7 }, ls(globalenv()))
+    parallel::clusterExport(cl, vars, envir = globalenv())  # fonksiyonları ve küçük nesneleri gönder
+    parallel::clusterSetRNGStream(cl, sample.int(1e9, 1))   # her çekirdeğe ayrı rastgele sayı akışı
+    parallel::parLapply(cl, seq_len(n), fun)                # Yol A: paralel
+  }, error = function(e) { cat("  paralel çalışmadı, seri devam:", conditionMessage(e), "\n"); NULL })
+  if (is.null(out)) out <- lapply(seq_len(n_serial), fun)   # Yol B: seri (daha az tekrar)
+  out
+}
+real_labs <- function(dsn, ctn) {                           # gerçek veri: filtrelenmiş laboratuvarlar
+  g <- strsplit(ctn, "-")[[1]]; labs0 <- ds10[[dsn]]
+  s0 <- median(par10[[paste(dsn, ctn)]]$sigma^2); keep <- prefilter_real(labs0, g[1], g[2], s0)
+  list(labs = lapply(labs0, sub_lab, g1 = g[1], g2 = g[2], keep = keep), s0 = s0, labs0 = labs0, g = g)
+}
+
+# --- 10.1) Hızlı istatistikler (bölme/havuz sayısı parametreli; step07 ile aynı tanım) ---
+lab_lists_n <- function(lab, spl, btw) {
+  C <- mean(replicate(spl, { ia <- sample(ncol(lab$A)); ib <- sample(ncol(lab$B))
+    rbo_lists(list_sim(lab, ia[1:M_REP], ib[1:M_REP], "LFC", 0),
+              list_sim(lab, ia[M_REP + 1:M_REP], ib[M_REP + 1:M_REP], "LFC", 0)) }))
+  pool <- replicate(btw, list_sim(lab, sample(ncol(lab$A), M_REP), sample(ncol(lab$B), M_REP), "LFC", 0), simplify = FALSE)
+  list(C = C, pool = pool)
+}
+glob_stat_n <- function(labs, spl, btw) {                   # ortalama rho_hat (tüm çiftler)
+  ll <- lapply(labs, lab_lists_n, spl = spl, btw = btw); L <- length(labs); r <- c()
+  for (i in 1:(L - 1)) for (j in (i + 1):L)
+    r <- c(r, mean(mapply(rbo_lists, ll[[i]]$pool, ll[[j]]$pool)) / sqrt(ll[[i]]$C * ll[[j]]$C))
+  mean(r)
+}
+
+if (!REDO_STEP10 && all(file.exists(c(f10a, f10b, f10c, f10d, f10e, f10f, f10g)))) {
+  cat("step10 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP10 <- TRUE).\n")
+} else {
+  t10 <- Sys.time(); set.seed(20261101)
+  par10 <- readRDS(f_par)
+  ds10 <- list()
+  if (file.exists(f_maqc)) ds10$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds10$SEQC <- prep_seqc(readRDS(f_seqc))
+  K0 <- K_LIST; P0 <- P_RBO                                 # asıl k ve p (sonda geri yüklenir)
+
+  # ===== 10a) Null ızgara kontrolü =====
+  if (need10(f10a)) {
+    cat("10a: null ızgara kontrolü...\n")
+    exact_enum <- function(N, k, w) {                       # yuvarlamasız tam dağılım (küçük k için)
+      W <- rev(cumsum(rev(w))); st <- list(`0` = c(`0` = 1)) # durum: x -> (skor -> olasılık)
+      for (d in seq_len(k)) {
+        new <- list()
+        for (xs in names(st)) {
+          x <- as.integer(xs); pr <- step_probs(x, d - 1, N)
+          for (inc in 0:2) {
+            if (x + inc > d || pr[inc + 1] <= 0) next
+            sc <- round(as.numeric(names(st[[xs]])) + inc * W[d], 12)   # yeni skorlar (tam değer, 12 basamak)
+            key <- as.character(x + inc); v <- pr[inc + 1] * st[[xs]]
+            new[[key]] <- c(new[[key]], setNames(v, sc))
+          }
+        }
+        st <- lapply(new, function(v) tapply(v, names(v), sum))         # aynı skorları birleştir
+        st <- lapply(st, function(v) setNames(as.numeric(v), names(v)))
+      }
+      v <- unlist(unname(st)); s <- as.numeric(names(v)); a <- tapply(v, s, sum)
+      data.frame(score = as.numeric(names(a)), prob = as.numeric(a))
+    }
+    ga <- list()
+    for (pp in c(0.9, 0.98)) for (kk in c(8, 10)) {        # küçük ayarlar: tam sayım mümkün
+      w <- rbo_weights(kk, pp, "ext"); ex <- exact_enum(200, kk, w)
+      ex <- ex[order(ex$score), ]; ex$upper <- rev(cumsum(rev(ex$prob)))  # P(T >= t)
+      dg <- null_dist_dp(200, kk, w, NULL, N_BINS)
+      pg <- pvalue_dp(ex$score, dg)                         # ızgara p-değeri aynı noktalarda
+      okp <- ex$upper >= 1e-6
+      ga[[length(ga) + 1]] <- data.frame(check = "grid vs exact enumeration", N = 200, k = kk, p = pp,
+        n_bins = N_BINS, n_support = nrow(ex), max_abs_p_diff = max(abs(pg[okp] - ex$upper[okp])),
+        max_rel_p_diff = max(abs(pg[okp] - ex$upper[okp]) / ex$upper[okp]),
+        mean_exact = sum(ex$score * ex$prob), mean_grid = sum(dg$value * dg$prob),
+        score_error_bound = kk * dg$h / 2)                  # |T_hat - T| <= k * h / 2
+    }
+    for (NN in c(17260, 41006)) {                           # gerçek ayar: 20.000 vs 80.000 hücre
+      w <- rbo_weights(100, 0.98, "ext")
+      d1 <- null_dist_dp(NN, 100, w, NULL, 20000); d2 <- null_dist_dp(NN, 100, w, NULL, 80000)
+      tt <- quantile_dp(c(0.5, 0.9, 0.95, 0.99, 0.999, 0.9999), d2)
+      p1 <- pvalue_dp(tt, d1); p2 <- pvalue_dp(tt, d2)
+      ga[[length(ga) + 1]] <- data.frame(check = "20000 vs 80000 cells", N = NN, k = 100, p = 0.98,
+        n_bins = 20000, n_support = NA, max_abs_p_diff = max(abs(p1 - p2)), max_rel_p_diff = max(abs(p1 - p2) / p2),
+        mean_exact = null_moments_exact(NN, 100, w)$mean, mean_grid = sum(d1$value * d1$prob),
+        score_error_bound = 100 * d1$h / 2)
+    }
+    write.csv(do.call(rbind, ga), f10a, row.names = FALSE); print(do.call(rbind, ga), digits = 3)
+  }
+
+  # ===== 10b) Genel testler, B = 1999 =====
+  if (need10(f10b)) {
+    gb <- list()
+    for (i in seq_len(nrow(configs7))) {
+      cf <- configs7[i, ]; if (is.null(ds10[[cf$dataset]])) next
+      rl <- real_labs(cf$dataset, cf$contrast); labs_b <- rl$labs; s0_b <- rl$s0
+      cat(sprintf("10b: %s %s, %d permütasyon (%d çekirdek)...\n", cf$dataset, cf$contrast, B_FINAL, N_CORES))
+      obs <- all_stats(labs_b, "LFC", s0_b)$glob
+      perm <- unlist(run_reps(B_FINAL, function(r) all_stats(permute_labs(labs_b), "LFC", s0_b)$glob))
+      B <- length(perm); p <- (1 + sum(perm <= obs)) / (B + 1)
+      gb[[length(gb) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, n_labs = length(labs_b),
+        T_obs = obs, T_perm_mean = mean(perm), p_global = p, mc_se = sqrt(p * (1 - p) / B), B = B)
+      write.csv(do.call(rbind, gb), f10b, row.names = FALSE)   # her yapılandırmadan sonra kaydet
+    }
+    print(do.call(rbind, gb), digits = 3)
+  }
+
+  # ===== 10c) k ve p duyarlılığı =====
+  if (need10(f10c)) {
+    kp <- data.frame(k = c(50, 200, 100, 100, 100), p = c(0.98, 0.98, 0.90, 0.95, 0.98))
+    gc <- list()
+    for (i in seq_len(nrow(configs7))) {
+      cf <- configs7[i, ]; if (is.null(ds10[[cf$dataset]])) next
+      rl <- real_labs(cf$dataset, cf$contrast); labs_c <- rl$labs; s0_c <- rl$s0
+      for (j in seq_len(nrow(kp))) {
+        K_LIST <- kp$k[j]; P_RBO <- kp$p[j]                 # geçici k ve p (işçilere de gönderilir)
+        cat(sprintf("10c: %s %s, k=%d p=%.2f ...\n", cf$dataset, cf$contrast, K_LIST, P_RBO))
+        st <- all_stats(labs_c, "LFC", s0_c)
+        perm <- unlist(run_reps(B_SENS, function(r) all_stats(permute_labs(labs_c), "LFC", s0_c)$glob))
+        gc[[length(gc) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, k = K_LIST, p_rbo = P_RBO,
+          C_min = min(st$C), C_max = max(st$C), T_obs = st$glob, T_perm_mean = mean(perm),
+          p_global = (1 + sum(perm <= st$glob)) / (length(perm) + 1), B = length(perm))
+      }
+      K_LIST <- K0; P_RBO <- P0
+      write.csv(do.call(rbind, gc), f10c, row.names = FALSE)
+    }
+    K_LIST <- K0; P_RBO <- P0; print(do.call(rbind, gc), digits = 3)
+  }
+
+  # ===== 10d) Genel testin simülasyonu =====
+  if (need10(f10d)) {
+    sim_lab_corr <- function(cp, n, Lmat, b_sd = 0) {       # genler arası korelasyonlu gürültü (5 gizli faktör)
+      G <- nrow(cp); b <- rnorm(G, 0, b_sd)
+      e <- function() sqrt(0.5) * matrix(rnorm(G * n), G) + sqrt(0.5) * Lmat %*% matrix(rnorm(5 * n), 5)
+      list(A = (cp$mu + b) / 2 + cp$sigma * e(), B = -(cp$mu + b) / 2 + cp$sigma * e())
+    }
+    scen <- data.frame(name = c("null", "null_unequal_noise", "null_correlated_genes", "null_4_labs",
+                                "all_labs_kappa_0.25", "all_labs_kappa_0.5", "two_labs_kappa_1"),
+                       L = c(6, 6, 6, 4, 6, 6, 6))
+    gd <- if (file.exists(f10d) && !REDO_STEP10) read.csv(f10d) else NULL
+    for (bn in c("MAQC", "SEQC")) for (si in seq_len(nrow(scen))) {
+      if (!is.null(gd) && any(gd$base == bn & gd$scenario == scen$name[si])) next   # bitmiş senaryoyu atla
+      cp_d <- par10[[paste(bn, "A-B")]]; if (is.null(cp_d)) next
+      cp_d <- prefilter(cp_d, M_REP, median(cp_d$sigma^2)); n_d <- n_rep_of[[bn]]; sc_d <- scen[si, ]
+      cat(sprintf("10d: %s %s (%d tekrar x %d permütasyon)...\n", bn, sc_d$name, R_GLOB, B_GLOB_SIM))
+      res <- run_reps(R_GLOB, function(r) {
+        Lmat <- matrix(rnorm(nrow(cp_d) * 5, 0, sqrt(1 / 5)), nrow(cp_d))
+        noise <- if (sc_d$name == "null_unequal_noise") c(0.8, 0.9, 1, 1, 1.1, 1.25) else rep(1, sc_d$L)
+        kap <- switch(sc_d$name, all_labs_kappa_0.25 = rep(0.25, sc_d$L), all_labs_kappa_0.5 = rep(0.5, sc_d$L),
+                      two_labs_kappa_1 = c(1, 1, rep(0, sc_d$L - 2)), rep(0, sc_d$L))
+        labs_s <- lapply(seq_len(sc_d$L), function(l)
+          if (sc_d$name == "null_correlated_genes") sim_lab_corr(cp_d, n_d, Lmat)
+          else sim_lab(cp_d, n_d, kap[l] * cp_d$sigma, noise[l]))
+        obs <- glob_stat_n(labs_s, SPL10, BTW10)
+        perm <- replicate(B_GLOB_SIM, glob_stat_n(permute_labs(labs_s), SPL10, BTW10))
+        c(T = obs, p = (1 + sum(perm <= obs)) / (B_GLOB_SIM + 1))
+      }, n_serial = R_GLOB_SER)
+      v <- do.call(rbind, res)
+      gd <- rbind(gd, data.frame(base = bn, scenario = sc_d$name, n_labs = sc_d$L, n_rep_per_sample = n_d,
+        n_sim = nrow(v), B_perm = B_GLOB_SIM, mean_T = mean(v[, "T"]),
+        reject_05 = mean(v[, "p"] <= 0.05), reject_10 = mean(v[, "p"] <= 0.10),
+        mc_se_05 = sqrt(mean(v[, "p"] <= 0.05) * (1 - mean(v[, "p"] <= 0.05)) / nrow(v))))
+      write.csv(gd, f10d, row.names = FALSE)                # her senaryodan sonra kaydet
+    }
+    print(gd, digits = 3)
+  }
+
+  # ===== 10e) Parti teşhisi simülasyonu =====
+  if (need10(f10e)) {
+    sim_lab_shared_batch <- function(cp, n, beta) {         # A ve B'de AYNI parti etkisi (MAY'deki gibi)
+      lab <- sim_lab(cp, n); bt <- rep(1:2, c(ceiling(n / 2), floor(n / 2)))
+      for (b in 1:2) { dlt <- beta * cp$sigma * rnorm(nrow(cp))
+        lab$A[, bt == b] <- lab$A[, bt == b] + dlt; lab$B[, bt == b] <- lab$B[, bt == b] + dlt }
+      lab$bA <- bt; lab$bB <- bt; lab
+    }
+    cv10 <- read.csv(f_curves); ge <- list()
+    for (bn in c("MAQC", "SEQC")) {
+      cp_full <- par10[[paste(bn, "A-B")]]; if (is.null(cp_full)) next
+      n_e <- n_rep_of[[bn]]; cp_e <- prefilter(cp_full, M_REP, median(cp_full$sigma^2))
+      q975 <- cv10$q975_rho[cv10$dataset == bn & cv10$contrast == "A-B" & cv10$ranking == "LFC" & cv10$kappa == 0]
+      for (beta in c(0, 0.25, 0.5, 1)) {
+        cat(sprintf("10e: %s beta=%.2f ...\n", bn, beta))
+        fl <- replicate(R_BATCH, {                          # teşhis kuralı (tüm genlerle, gerçek veri gibi)
+          lab <- sim_lab_shared_batch(cp_full, n_e, beta)
+          pa <- best_partition(rep_cor(lab$A)); pb <- best_partition(rep_cor(lab$B))
+          c(flag = pa$score >= BATCH_MIN && pb$score >= BATCH_MIN && same_part(pa$g, pb$g),
+            correct = same_part(pa$g, lab$bA), score = min(pa$score, pb$score))
+        })
+        rr <- run_reps(R_BATCH_RHO, function(r) {           # rho_hat: partili lab vs normal lab
+          lb <- sim_lab_shared_batch(cp_e, n_e, beta); lo <- sim_lab(cp_e, n_e)
+          Ls <- lab_lists_n(lb, SPL10, BTW10); Lo <- lab_lists_n(lo, SPL10, BTW10)
+          Lb <- lab_lists_batch(lb, "LFC", 0)
+          c(std = mean(mapply(rbo_lists, Ls$pool, Lo$pool)) / sqrt(Ls$C * Lo$C),
+            bal = mean(mapply(rbo_lists, Lb$pool, Lo$pool)) / sqrt(Lb$C * Lo$C))
+        }, n_serial = 40)
+        rr <- do.call(rbind, rr)
+        ge[[length(ge) + 1]] <- data.frame(base = bn, beta = beta, n_rep_per_sample = n_e, n_sim_flag = R_BATCH,
+          flag_rate = mean(fl["flag", ]), correct_partition_rate = mean(fl["correct", ]),
+          mean_min_score = mean(fl["score", ]), n_sim_rho = nrow(rr),
+          mean_rho_random_split = mean(rr[, "std"]), mean_rho_balanced = mean(rr[, "bal"]),
+          prop_random_above_null_q975 = mean(rr[, "std"] > q975), prop_balanced_above_null_q975 = mean(rr[, "bal"] > q975),
+          null_q975 = q975)
+        write.csv(do.call(rbind, ge), f10e, row.names = FALSE)
+      }
+    }
+    print(do.call(rbind, ge), digits = 3)
+  }
+
+  # ===== 10f) Diğer ölçütlerle karşılaştırma (gerçek veri) =====
+  if (need10(f10f) || need10(f10g)) {
+    has_idr <- requireNamespace("idr", quietly = TRUE)       # Yol A: CRAN idr paketi
+    if (!has_idr) has_idr <- tryCatch({ install.packages("idr"); requireNamespace("idr", quietly = TRUE) },
+                                      error = function(e) FALSE)   # Yol B: IDR olmadan devam
+    idr_n <- function(a, b) {                               # IDR < 0.05 olan gen sayısı (|LFC| sinyal olarak)
+      if (!has_idr) return(NA)
+      tryCatch({ fit <- idr::est.IDR(cbind(abs(a), abs(b)), mu = 2.6, sigma = 1.3, rho = 0.8, p = 0.1,
+                                     eps = 0.001, max.ite = 30)
+                 sum(fit$IDR < 0.05) }, error = function(e) NA)
+    }
+    rp10 <- read.csv(f_pairs); cp6 <- list(); cl6 <- list()
+    for (i in seq_len(nrow(configs7))) {
+      cf <- configs7[i, ]; if (is.null(ds10[[cf$dataset]])) next
+      rl <- real_labs(cf$dataset, cf$contrast); labs_f <- rl$labs
+      lfc <- sapply(labs_f, function(l) rowMeans(l$A) - rowMeans(l$B))     # tüm tekrarlarla LFC
+      tops <- apply(lfc, 2, function(v) order(-abs(v))[1:K_LIST])
+      pr <- combn(names(labs_f), 2)
+      for (j in seq_len(ncol(pr))) {
+        a <- pr[1, j]; b <- pr[2, j]
+        r6 <- rp10[rp10$dataset == cf$dataset & rp10$contrast == cf$contrast & rp10$ranking == "LFC" &
+                   rp10$lab1 == a & rp10$lab2 == b, ]
+        cp6[[length(cp6) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, lab1 = a, lab2 = b,
+          rbo_full_data = rbo_lists(tops[, a], tops[, b]),
+          overlap_top100 = length(intersect(tops[, a], tops[, b])) / K_LIST,
+          spearman_lfc = cor(lfc[, a], lfc[, b], method = "spearman"),
+          idr_reproducible_n = idr_n(lfc[, a], lfc[, b]),
+          E_two_reps = if (nrow(r6)) r6$E else NA, rho_hat = if (nrow(r6)) r6$rho_hat else NA)
+      }
+    }
+    cmp <- do.call(rbind, cp6); write.csv(cmp, f10f, row.names = FALSE)
+    for (i in seq_len(nrow(configs7))) {                    # laboratuvar özeti: diğerleriyle ortalama
+      cf <- configs7[i, ]; d <- cmp[cmp$dataset == cf$dataset & cmp$contrast == cf$contrast, ]; if (!nrow(d)) next
+      for (l in unique(c(d$lab1, d$lab2))) {
+        s <- d[d$lab1 == l | d$lab2 == l, ]
+        cl6[[length(cl6) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, lab = l,
+          mean_rbo_full = mean(s$rbo_full_data), mean_overlap100 = mean(s$overlap_top100),
+          mean_spearman = mean(s$spearman_lfc), mean_idr_n = mean(s$idr_reproducible_n),
+          mean_E_two_reps = mean(s$E_two_reps), mean_rho_hat = mean(s$rho_hat))
+      }
+    }
+    cl6 <- do.call(rbind, cl6)
+    for (m in c("mean_rbo_full", "mean_overlap100", "mean_spearman", "mean_idr_n", "mean_E_two_reps", "mean_rho_hat"))
+      cl6[[paste0("rank_", sub("mean_", "", m))]] <- ave(-cl6[[m]], cl6$dataset, cl6$contrast, FUN = function(z) rank(z, na.last = "keep"))  # 1 = en yüksek
+    write.csv(cl6, f10g, row.names = FALSE); print(cl6, digits = 3)
+  }
+  K_LIST <- K0; P_RBO <- P0
+  cat(sprintf("step10 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t10, units = "mins"))))
+}
+cat("step10 için gönderilecek dosyalar:", f10a, f10b, f10c, f10d, f10e, f10f, f10g, "\n")
+
+
+# ---------------------------------------------------------------------
+# step11: İKİNCİ TUR EK ANALİZLER (hakem önerilerinden eksik kalanlar)
+#  11a  IDR (CRAN idr) ve MaRR (Bioconductor marr) ile karşılaştırma — step10f'de IDR hatası düzeltildi
+#       (hata: est.IDR'de argüman adı "eps" olmalıydı; "eps.loglik" yazılmıştı)
+#  11b  Dışarıda bırakma testleri B = 999 permütasyonla (sınırdaki p-değerleri için)
+#  11c  Genel test simülasyonu ek senaryolar: 4 laboratuvarda güç, MAQC'de 4 tekrarla I. tip hata ve güç
+# ---------------------------------------------------------------------
+REDO_STEP11 <- FALSE
+B_LOO11     <- 999          # 11b permütasyon sayısı
+f11a <- "step11a_idr_marr_pairs.csv"
+f11b <- "step11a_idr_marr_labs.csv"
+f11c <- "step11b_leave_out_B999.csv"
+f11d <- "step11c_global_test_sim_extra.csv"
+need11 <- function(f) REDO_STEP11 || !file.exists(f)
+
+if (!REDO_STEP11 && all(file.exists(c(f11a, f11b, f11c, f11d)))) {
+  cat("step11 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP11 <- TRUE).\n")
+} else {
+  t11 <- Sys.time(); set.seed(20261102)
+  par10 <- readRDS(f_par); ds10 <- list()                   # real_labs() bu iki nesneyi kullanır
+  if (file.exists(f_maqc)) ds10$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds10$SEQC <- prep_seqc(readRDS(f_seqc))
+
+  # ===== 11a) IDR ve MaRR =====
+  if (need11(f11a) || need11(f11b)) {
+    has_idr <- requireNamespace("idr", quietly = TRUE)       # Yol A: CRAN idr
+    if (!has_idr) has_idr <- tryCatch({ install.packages("idr", repos = "https://cloud.r-project.org")
+                                        requireNamespace("idr", quietly = TRUE) }, error = function(e) FALSE)
+    has_marr <- requireNamespace("marr", quietly = TRUE)     # Yol B: Bioconductor marr
+    if (!has_marr) has_marr <- tryCatch({ bioc_ok("marr") }, error = function(e) FALSE)
+    cat(sprintf("11a: idr paketi %s, marr paketi %s\n", ifelse(has_idr, "var", "YOK"), ifelse(has_marr, "var", "YOK")))
+    run_idr <- function(a, b) {                             # IDR < 0.05 olan gen sayısı (|LFC| büyük = güçlü sinyal)
+      if (!has_idr) return(c(NA, "idr paketi yok"))
+      tryCatch({ fit <- idr::est.IDR(cbind(abs(a), abs(b)), mu = 2.6, sigma = 1.3, rho = 0.8, p = 0.1,
+                                     eps = 0.001, max.ite = 30)
+                 c(sum(fit$IDR < 0.05), "ok") }, error = function(e) c(NA, conditionMessage(e)))
+    }
+    run_marr <- function(a, b) {                            # MaRR: yeniden üretilebilir gen yüzdesi (tek örnek çifti)
+      if (!has_marr) return(c(NA, "marr paketi yok"))
+      tryCatch({ m <- marr::Marr(cbind(abs(a), abs(b)), pSamplepairs = 0.75, pFeatures = 0.75, alpha = 0.05)
+                 v <- marr::MarrSamplepairs(m); c(as.numeric(v[1]), "ok") }, error = function(e) c(NA, conditionMessage(e)))
+    }
+    pr11 <- list()
+    for (i in seq_len(nrow(configs7))) {
+      cf <- configs7[i, ]; if (is.null(ds10[[cf$dataset]])) next
+      rl <- real_labs(cf$dataset, cf$contrast)
+      lfc <- sapply(rl$labs, function(l) rowMeans(l$A) - rowMeans(l$B))  # tüm tekrarlarla LFC (filtrelenmiş genler)
+      pr <- combn(colnames(lfc), 2)
+      for (j in seq_len(ncol(pr))) {
+        a <- pr[1, j]; b <- pr[2, j]; ri <- run_idr(lfc[, a], lfc[, b]); rm <- run_marr(lfc[, a], lfc[, b])
+        pr11[[length(pr11) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, lab1 = a, lab2 = b,
+          n_genes = nrow(lfc), idr_reproducible_n = as.numeric(ri[1]), idr_status = ri[2],
+          marr_pct_reproducible = as.numeric(rm[1]), marr_status = rm[2])
+      }
+      cat(sprintf("11a: %s %s bitti\n", cf$dataset, cf$contrast))
+    }
+    pr11 <- do.call(rbind, pr11); write.csv(pr11, f11a, row.names = FALSE)
+    lb11 <- list()
+    for (i in seq_len(nrow(configs7))) {                    # laboratuvar özeti + sıralar
+      cf <- configs7[i, ]; d <- pr11[pr11$dataset == cf$dataset & pr11$contrast == cf$contrast, ]; if (!nrow(d)) next
+      for (l in unique(c(d$lab1, d$lab2))) { s <- d[d$lab1 == l | d$lab2 == l, ]
+        lb11[[length(lb11) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, lab = l,
+          mean_idr_n = mean(s$idr_reproducible_n), mean_marr_pct = mean(s$marr_pct_reproducible)) }
+    }
+    lb11 <- do.call(rbind, lb11)
+    for (m in c("mean_idr_n", "mean_marr_pct"))
+      lb11[[paste0("rank_", sub("mean_", "", m))]] <- ave(-lb11[[m]], lb11$dataset, lb11$contrast, FUN = function(z) rank(z, na.last = "keep"))
+    write.csv(lb11, f11b, row.names = FALSE); print(lb11, digits = 3)
+    print(table(pr11$idr_status)); print(table(pr11$marr_status))   # hata varsa mesajı görünsün
+  }
+
+  # ===== 11b) Dışarıda bırakma testleri, B = 999 =====
+  if (need11(f11c)) {
+    loo11 <- list(list(dataset = "MAQC", contrast = "A-B", drops = c(as.list(paste0("lab", 1:6)), list(c("lab1", "lab6")))),
+                  list(dataset = "MAQC", contrast = "C-D", drops = c(as.list(paste0("lab", 1:6)), list(c("lab1", "lab6")))),
+                  list(dataset = "SEQC", contrast = "A-B", drops = list("MAY")))
+    lo11 <- if (file.exists(f11c) && !REDO_STEP11) read.csv(f11c) else NULL
+    for (pl in loo11) {
+      if (is.null(ds10[[pl$dataset]])) next
+      rl <- real_labs(pl$dataset, pl$contrast); s0_l <- rl$s0
+      for (dr in pl$drops) {
+        tag <- paste(dr, collapse = "+")
+        if (!is.null(lo11) && any(lo11$dataset == pl$dataset & lo11$contrast == pl$contrast & lo11$left_out == tag)) next
+        labs_l <- rl$labs[setdiff(names(rl$labs), dr)]
+        cat(sprintf("11b: %s %s - %s, %d permütasyon...\n", pl$dataset, pl$contrast, tag, B_LOO11))
+        obs <- all_stats(labs_l, "LFC", s0_l)$glob
+        perm <- unlist(run_reps(B_LOO11, function(r) all_stats(permute_labs(labs_l), "LFC", s0_l)$glob))
+        p <- (1 + sum(perm <= obs)) / (length(perm) + 1)
+        lo11 <- rbind(lo11, data.frame(dataset = pl$dataset, contrast = pl$contrast, left_out = tag, n_labs = length(labs_l),
+          T_obs = obs, T_perm_mean = mean(perm), p_global = p, mc_se = sqrt(p * (1 - p) / length(perm)), B = length(perm)))
+        write.csv(lo11, f11c, row.names = FALSE)            # her testten sonra kaydet
+      }
+    }
+    print(lo11, digits = 3)
+  }
+
+  # ===== 11c) Genel test simülasyonu: ek senaryolar =====
+  if (need11(f11d)) {
+    sc11 <- data.frame(base = c("MAQC", "SEQC", "MAQC", "MAQC"),
+                       name = c("kappa_0.5_4_labs", "kappa_0.5_4_labs", "null_4_reps", "kappa_0.5_4_reps"),
+                       L = c(4, 4, 6, 6), n = c(5, 4, 4, 4), kap = c(0.5, 0.5, 0, 0.5))
+    gx <- if (file.exists(f11d) && !REDO_STEP11) read.csv(f11d) else NULL
+    for (si in seq_len(nrow(sc11))) {
+      s11 <- sc11[si, ]
+      if (!is.null(gx) && any(gx$base == s11$base & gx$scenario == s11$name)) next
+      cp_x <- par10[[paste(s11$base, "A-B")]]; if (is.null(cp_x)) next
+      cp_x <- prefilter(cp_x, M_REP, median(cp_x$sigma^2))
+      cat(sprintf("11c: %s %s (%d tekrar x %d permütasyon)...\n", s11$base, s11$name, R_GLOB, B_GLOB_SIM))
+      res <- run_reps(R_GLOB, function(r) {
+        labs_s <- lapply(seq_len(s11$L), function(l) sim_lab(cp_x, s11$n, s11$kap * cp_x$sigma))
+        obs <- glob_stat_n(labs_s, SPL10, BTW10)
+        perm <- replicate(B_GLOB_SIM, glob_stat_n(permute_labs(labs_s), SPL10, BTW10))
+        c(T = obs, p = (1 + sum(perm <= obs)) / (B_GLOB_SIM + 1))
+      }, n_serial = R_GLOB_SER)
+      v <- do.call(rbind, res)
+      gx <- rbind(gx, data.frame(base = s11$base, scenario = s11$name, n_labs = s11$L, n_rep_per_sample = s11$n,
+        kappa = s11$kap, n_sim = nrow(v), B_perm = B_GLOB_SIM, mean_T = mean(v[, "T"]),
+        reject_05 = mean(v[, "p"] <= 0.05), reject_10 = mean(v[, "p"] <= 0.10)))
+      write.csv(gx, f11d, row.names = FALSE)
+    }
+    print(gx, digits = 3)
+  }
+  cat(sprintf("step11 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t11, units = "mins"))))
+}
+cat("step11 için gönderilecek dosyalar:", f11a, f11b, f11c, f11d, "\n")
+
+
+# ---------------------------------------------------------------------
+# step12: ÜÇÜNCÜ TUR (GPT + DeepSeek 2. değerlendirme)
+#  12a  Monte Carlo hatasız nokta tahminleri: tavan C TÜM ayrık bölmeler üzerinden, E TÜM 2'li tekrar
+#       kombinasyonları üzerinden (rastgele çekiliş yok). MAY için standart ve partiye dengeli bölmeler de tam.
+#       -> Fig2, Fig3, Fig5 bu değerlerle yeniden çizilir (önceki koşular arasındaki MAY farkları ortadan kalkar)
+#  12b  SEQC C vs D genel testi (tavanlar düşük olsa da permütasyon kalibre) B = 999
+#  12c  Güç simülasyonu daha hassas: 300 veri seti, 99 permütasyon; null, kappa 0.25 / 0.5 ve SEYREK etki
+#       (genlerin %10'unda kappa = 2); binom %95 güven aralıklarıyla       (EN UZUN parça; en sona konuldu)
+# ---------------------------------------------------------------------
+REDO_STEP12 <- FALSE
+RUN_12C     <- TRUE         # FALSE: uzun güç simülasyonu atlanır
+R_POW12     <- 300          # 12c senaryo başına veri seti (paralel); seri ise R_POW12_SER
+R_POW12_SER <- 100
+B_POW12     <- 99
+B_CD12      <- 999
+f12a <- "step12a_pairs_allsplits.csv"
+f12b <- "step12a_ceilings_allsplits.csv"
+f12c <- "step12a_may_batch_allsplits.csv"
+f12d <- "step12b_seqc_cd_global.csv"
+f12e <- "step12c_power_sim.csv"
+need12 <- function(f) REDO_STEP12 || !file.exists(f)
+
+# --- 12.0) Tüm 2'li tekrar kümeleri için listeler bir kez üretilir (önbellek) ---
+two_sets <- function(n) combn(n, 2, simplify = FALSE)       # {1..n} içinden tüm 2'li kümeler
+lab_cache <- function(lab) {                                # her (A 2'li, B 2'li) için ilk-k listesi
+  SA <- two_sets(ncol(lab$A)); SB <- two_sets(ncol(lab$B))
+  L <- vector("list", length(SA) * length(SB)); key <- character(length(L)); z <- 0
+  for (i in seq_along(SA)) for (j in seq_along(SB)) { z <- z + 1
+    L[[z]] <- top_k(score_fun(lab$A[, SA[[i]], drop = FALSE], lab$B[, SB[[j]], drop = FALSE], "LFC"), K_LIST)
+    key[z] <- paste(paste(SA[[i]], collapse = ""), paste(SB[[j]], collapse = ""), sep = "|") }
+  names(L) <- key; L
+}
+k_of <- function(a, b) paste(paste(sort(a), collapse = ""), paste(sort(b), collapse = ""), sep = "|")
+ceiling_all <- function(lab, LC, okA = NULL, okB = NULL) {  # tüm ayrık 2+2 bölmeler (isteğe bağlı: yalnız dengeli)
+  PA <- disjoint_pairs(ncol(lab$A), 2); PB <- disjoint_pairs(ncol(lab$B), 2, ordered = TRUE)
+  if (!is.null(okA)) PA <- Filter(okA, PA); if (!is.null(okB)) PB <- Filter(okB, PB)
+  r <- c(); for (a in PA) for (b in PB) r <- c(r, rbo_lists(LC[[k_of(a[[1]], b[[1]])]], LC[[k_of(a[[2]], b[[2]])]]))
+  c(C = mean(r), n = length(r))
+}
+between_all <- function(L1, L2) mean(outer(seq_along(L1), seq_along(L2), Vectorize(function(i, j) rbo_lists(L1[[i]], L2[[j]]))))
+
+if (!REDO_STEP12 && all(file.exists(c(f12a, f12b, f12c, f12d))) && (!RUN_12C || file.exists(f12e))) {
+  cat("step12 çıktıları mevcut, atlanıyor (yeniden için REDO_STEP12 <- TRUE).\n")
+} else {
+  t12 <- Sys.time(); set.seed(20261103)
+  par10 <- readRDS(f_par); ds10 <- list()
+  if (file.exists(f_maqc)) ds10$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds10$SEQC <- prep_seqc(readRDS(f_seqc))
+
+  # ===== 12a) Tam (rastgele çekilişsiz) C, E, rho =====
+  if (need12(f12a) || need12(f12b) || need12(f12c)) {
+    pa12 <- list(); ce12 <- list(); mb12 <- list()
+    bd <- read.csv(f_bdiag, colClasses = c(part_A = "character", part_B = "character"))
+    for (i in seq_len(nrow(configs7))) {
+      cf <- configs7[i, ]; if (is.null(ds10[[cf$dataset]])) next
+      cat(sprintf("12a: %s %s — tüm bölmeler...\n", cf$dataset, cf$contrast))
+      rl <- real_labs(cf$dataset, cf$contrast); labs <- rl$labs
+      LC <- lapply(labs, lab_cache)                         # laboratuvar başına liste önbelleği
+      Cv <- sapply(names(labs), function(l) ceiling_all(labs[[l]], LC[[l]]))
+      for (l in names(labs)) ce12[[length(ce12) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast,
+        lab = l, C = Cv["C", l], n_splits = Cv["n", l])
+      pr <- combn(names(labs), 2)
+      for (j in seq_len(ncol(pr))) { a <- pr[1, j]; b <- pr[2, j]
+        E <- between_all(LC[[a]], LC[[b]]); C1 <- Cv["C", a]; C2 <- Cv["C", b]
+        pa12[[length(pa12) + 1]] <- data.frame(dataset = cf$dataset, contrast = cf$contrast, ranking = "LFC",
+          lab1 = a, lab2 = b, C1 = C1, C2 = C2, E = E, rho_hat = E / sqrt(C1 * C2),
+          reliable = min(C1, C2) >= RHO_MIN_C6) }
+      # partili laboratuvar (A-B, step08 bayrağı): dengeli bölmeler ve dengeli listeler
+      if (cf$contrast == "A-B") for (r in which(bd$dataset == cf$dataset & bd$batch_flag)) {
+        ln <- bd$lab[r]; gA <- as.integer(strsplit(bd$part_A[r], "")[[1]]); gB <- as.integer(strsplit(bd$part_B[r], "")[[1]])
+        balA <- function(s) length(unique(gA[s])) == 2; balB <- function(s) length(unique(gB[s])) == 2   # 2'li küme her partiden bir tekrar
+        okA <- function(p) balA(p[[1]]) && balA(p[[2]]); okB <- function(p) balB(p[[1]]) && balB(p[[2]])
+        Cb <- ceiling_all(labs[[ln]], LC[[ln]], okA, okB)
+        SA <- two_sets(ncol(labs[[ln]]$A)); SB <- two_sets(ncol(labs[[ln]]$B))
+        keepk <- unlist(lapply(SA, function(a) lapply(SB, function(b) if (balA(a) && balB(b)) k_of(a, b) else NULL)))
+        Lbal <- LC[[ln]][keepk]
+        for (o in setdiff(names(labs), ln)) {
+          Es <- between_all(LC[[ln]], LC[[o]]); Eb <- between_all(Lbal, LC[[o]])
+          mb12[[length(mb12) + 1]] <- data.frame(dataset = cf$dataset, batch_lab = ln, other_lab = o, C_other = Cv["C", o],
+            C_standard = Cv["C", ln], E_standard = Es, rho_standard = Es / sqrt(Cv["C", ln] * Cv["C", o]),
+            C_batch_aware = Cb[["C"]], E_batch_aware = Eb, rho_batch_aware = Eb / sqrt(Cb[["C"]] * Cv["C", o]),
+            n_balanced_splits = Cb[["n"]], n_balanced_lists = length(Lbal))
+        }
+      }
+    }
+    write.csv(do.call(rbind, pa12), f12a, row.names = FALSE); write.csv(do.call(rbind, ce12), f12b, row.names = FALSE)
+    write.csv(if (length(mb12)) do.call(rbind, mb12) else data.frame(note = "partili laboratuvar yok"), f12c, row.names = FALSE)
+    print(do.call(rbind, ce12), digits = 3); if (length(mb12)) print(do.call(rbind, mb12), digits = 3)
+
+    # Şekiller 2, 3, 5 bu kesin değerlerle yeniden çizilir (Fig1 ve Fig4 değişmez)
+    cv12 <- read.csv(f_curves); cv12$label <- cfg_label(cv12$dataset, cv12$contrast); cv12 <- cv12[cv12$ranking == "LFC", ]
+    nb12 <- cv12[cv12$kappa == 0, c("label", "q025_rho", "q975_rho")]
+    rp12 <- read.csv(f12a); rp12$label <- cfg_label(rp12$dataset, rp12$contrast)
+    cal12 <- read.csv(f_cal); fl12 <- setNames(cal12$floor_rbo, cfg_label(cal12$dataset, cal12$contrast))
+    set.seed(9)                                             # noktaların yatay dağılımı aynı kalsın
+    save_fig("Fig2", 6.8, 3.8, fig2(rp12, fl12))
+    save_fig("Fig3", 7.2, 3.8, fig3(rp12, nb12))
+    bp12 <- read.csv(f12c); if ("rho_standard" %in% names(bp12))
+      save_fig("Fig5", 6.5, 3.6, fig5(bp12, nb12[nb12$label == "SEQC A vs B", ]))
+  }
+
+  # ===== 12b) SEQC C vs D genel testi =====
+  if (need12(f12d) && !is.null(ds10$SEQC)) {
+    rl <- real_labs("SEQC", "C-D"); labs_cd <- rl$labs; s0_cd <- rl$s0
+    cat(sprintf("12b: SEQC C-D genel test, %d permütasyon...\n", B_CD12))
+    st <- all_stats(labs_cd, "LFC", s0_cd)
+    perm <- unlist(run_reps(B_CD12, function(r) all_stats(permute_labs(labs_cd), "LFC", s0_cd)$glob))
+    p <- (1 + sum(perm <= st$glob)) / (length(perm) + 1)
+    write.csv(data.frame(dataset = "SEQC", contrast = "C-D", n_labs = length(labs_cd), C_min = min(st$C), C_max = max(st$C),
+      T_obs = st$glob, T_perm_mean = mean(perm), T_perm_q025 = quantile(perm, 0.025, names = FALSE),
+      T_perm_q975 = quantile(perm, 0.975, names = FALSE), p_global = p, mc_se = sqrt(p * (1 - p) / length(perm)), B = length(perm)),
+      f12d, row.names = FALSE)
+    print(read.csv(f12d), digits = 3)
+  }
+
+  # ===== 12c) Daha hassas güç simülasyonu =====
+  if (RUN_12C && need12(f12e)) {
+    sim_lab_sparse <- function(cp, n, frac = 0.1, kap = 2) {   # etki genlerin yalnız %10'unda
+      b <- ifelse(runif(nrow(cp)) < frac, rnorm(nrow(cp), 0, kap * cp$sigma), 0)
+      list(A = (cp$mu + b) / 2 + cp$sigma * matrix(rnorm(nrow(cp) * n), nrow(cp)),
+           B = -(cp$mu + b) / 2 + cp$sigma * matrix(rnorm(nrow(cp) * n), nrow(cp)))
+    }
+    sc12 <- data.frame(name = c("null", "kappa_0.25", "kappa_0.5", "sparse_10pct_kappa_2"), kap = c(0, 0.25, 0.5, NA))
+    pw <- if (file.exists(f12e) && !REDO_STEP12) read.csv(f12e, stringsAsFactors = FALSE) else NULL
+    for (bn in c("MAQC", "SEQC")) for (si in seq_len(nrow(sc12))) {
+      if (!is.null(pw) && any(pw$base == bn & pw$scenario == sc12$name[si])) next
+      cp_p <- par10[[paste(bn, "A-B")]]; cp_p <- prefilter(cp_p, M_REP, median(cp_p$sigma^2)); n_p <- n_rep_of[[bn]]; s_p <- sc12[si, ]
+      cat(sprintf("12c: %s %s (%d veri seti x %d permütasyon)...\n", bn, s_p$name, R_POW12, B_POW12))
+      res <- run_reps(R_POW12, function(r) {
+        labs_s <- lapply(1:6, function(l) if (is.na(s_p$kap)) sim_lab_sparse(cp_p, n_p) else sim_lab(cp_p, n_p, s_p$kap * cp_p$sigma))
+        obs <- glob_stat_n(labs_s, SPL10, BTW10)
+        perm <- replicate(B_POW12, glob_stat_n(permute_labs(labs_s), SPL10, BTW10))
+        c(T = obs, p = (1 + sum(perm <= obs)) / (B_POW12 + 1))
+      }, n_serial = R_POW12_SER)
+      v <- do.call(rbind, res); k5 <- sum(v[, "p"] <= 0.05); nn <- nrow(v)
+      ci <- binom.test(k5, nn)$conf.int                     # %95 Clopper-Pearson aralığı
+      pw <- rbind(pw, data.frame(base = bn, scenario = s_p$name, n_labs = 6, n_rep_per_sample = n_p, n_sim = nn, B_perm = B_POW12,
+        mean_T = mean(v[, "T"]), reject_05 = k5 / nn, ci_low = ci[1], ci_high = ci[2], reject_10 = mean(v[, "p"] <= 0.10)))
+      write.csv(pw, f12e, row.names = FALSE)
+    }
+    print(pw, digits = 3)
+  }
+  cat(sprintf("step12 bitti. Süre: %.1f dakika\n", as.numeric(difftime(Sys.time(), t12, units = "mins"))))
+}
+cat("step12 için gönderilecek dosyalar:", f12a, f12b, f12c, f12d, f12e, "+ figures/Fig2.png, Fig3.png, Fig5.png\n")
