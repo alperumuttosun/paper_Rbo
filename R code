@@ -2,7 +2,7 @@
 # Noise-ceiling normalisation of rank-biased overlap (RBO)
 # for the between-laboratory reproducibility of ranked gene lists
 #
-# Cumulative pipeline, step00-step14. Each step writes CSV files and
+# Cumulative pipeline, step00-step15. Each step writes CSV files and
 # is skipped when its outputs already exist (set REDO_STEPxx <- TRUE to rerun).
 # Internet access is needed only once, in step03 (data download).
 #
@@ -21,6 +21,7 @@
 # step12  exact estimates over all splits, SEQC C vs D, power simulation
 # step13  rho test versus a raw-agreement test (unequal replicate noise)
 # step14  TIF copies of the figures for journal submission
+# step15  processed data as gzip CSV (software-independent copies)
 # =====================================================================
 
 # ---- step00: folders and settings ----
@@ -2000,3 +2001,51 @@ if (!REDO_STEP14 && all(file.exists(tif_files))) {
   }
 }
 cat("step14 output files: figures/Fig1.tif ... Fig5.tif (PNG and PDF files are unchanged)\n")
+
+# ---- step15: software-independent copies of the processed data (gzip CSV) ----
+REDO_STEP15 <- FALSE  # TRUE rewrites the CSV files
+f15 <- c(maqc_expr = "step15_maqc_log2_expression.csv.gz", maqc_design = "step15_maqc_design.csv",
+         seqc_expr = "step15_seqc_log2cpm.csv.gz",         seqc_design = "step15_seqc_design.csv",
+         calib     = "step15_calib_params.csv.gz")
+
+labs_to_table <- function(labs) {                              # list of laboratories -> one matrix + design
+  cols <- list(); des <- list()
+  for (l in names(labs)) for (g in names(labs[[l]])) {
+    X <- labs[[l]][[g]]; if (!ncol(X)) next
+    id <- paste(l, g, seq_len(ncol(X)), sep = "_")
+    cols[[length(cols) + 1]] <- setNames(as.data.frame(X), id)
+    des[[length(des) + 1]] <- data.frame(column = id, laboratory = l, sample = g, replicate = seq_len(ncol(X)),
+                                         original_column = colnames(X))
+  }
+  list(expr = data.frame(feature_id = rownames(labs[[1]][[1]]), do.call(cbind, cols), check.names = FALSE),
+       design = do.call(rbind, des))
+}
+write_gz <- function(df, f) {                                  # method A: data.table, method B: base R
+  ok <- requireNamespace("data.table", quietly = TRUE) &&
+        isTRUE(tryCatch({ data.table::fwrite(df, f, compress = "gzip"); TRUE }, error = function(e) FALSE))
+  if (!ok) { con <- gzfile(f, "w"); write.csv(df, con, row.names = FALSE); close(con) }
+  cat(sprintf("  %s (%d rows x %d columns, %.1f MB)\n", f, nrow(df), ncol(df), file.size(f) / 1e6))
+}
+
+if (!REDO_STEP15 && all(file.exists(f15))) {
+  cat("step15 outputs exist, skipping (set REDO_STEP15 <- TRUE to rerun).\n")
+} else {
+  if (file.exists(f_maqc)) {
+    tb <- labs_to_table(prep_maqc(readRDS(f_maqc)))           # same processing as the analyses
+    write_gz(tb$expr, f15[["maqc_expr"]]); write.csv(tb$design, f15[["maqc_design"]], row.names = FALSE)
+  } else cat("step15: MAQC .rds not found\n")
+  if (file.exists(f_seqc)) {
+    tb <- labs_to_table(prep_seqc(readRDS(f_seqc)))
+    write_gz(tb$expr, f15[["seqc_expr"]]); write.csv(tb$design, f15[["seqc_design"]], row.names = FALSE)
+  } else cat("step15: SEQC .rds not found\n")
+  if (file.exists(f_par)) {
+    pl <- readRDS(f_par)
+    cp <- do.call(rbind, lapply(names(pl), function(nm) {     # gene-wise calibration parameters (mu, sigma, ...)
+      x <- pl[[nm]]; if (!is.data.frame(x)) return(NULL)
+      data.frame(configuration = nm, feature_id = if (!is.null(rownames(x))) rownames(x) else seq_len(nrow(x)), x,
+                 check.names = FALSE, row.names = NULL)
+    }))
+    if (!is.null(cp)) write_gz(cp, f15[["calib"]])
+  }
+}
+cat("step15 output files:", f15, "\n")
