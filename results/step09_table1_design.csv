@@ -1,0 +1,4 @@
+"Configuration","Platform","Laboratories","Replicates_per_lab","Genes_after_filter","Floor","Ceiling_C_range","Simulated_C_kappa0"
+"MAQC A vs B","Affymetrix HG-U133 Plus 2.0",6,"5",41006,0.0011,"0.81-0.87",0.85
+"MAQC C vs D","Affymetrix HG-U133 Plus 2.0",6,"5",41006,0.0011,"0.21-0.69",0.36
+"SEQC A vs B","Illumina HiSeq 2000",6,"4",17260,0.0025,"0.41-0.64",0.54

@@ -1,0 +1,5 @@
+"base","kappa","n_rep","B_perm","reject_05","reject_10","param_source"
+"MAQC",0,60,49,0.0333333333333333,0.0833333333333333,"step04 calibration (real data)"
+"MAQC",0.5,60,49,0.466666666666667,0.583333333333333,"step04 calibration (real data)"
+"SEQC",0,60,49,0.0333333333333333,0.133333333333333,"step04 calibration (real data)"
+"SEQC",0.5,60,49,0.55,0.716666666666667,"step04 calibration (real data)"
