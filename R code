@@ -2,7 +2,7 @@
 # Noise-ceiling normalisation of rank-biased overlap (RBO)
 # for the between-laboratory reproducibility of ranked gene lists
 #
-# Cumulative pipeline, step00-step13. Each step writes CSV files and
+# Cumulative pipeline, step00-step14. Each step writes CSV files and
 # is skipped when its outputs already exist (set REDO_STEPxx <- TRUE to rerun).
 # Internet access is needed only once, in step03 (data download).
 #
@@ -20,6 +20,7 @@
 # step11  IDR, leave-out tests (B = 999), extra simulation scenarios
 # step12  exact estimates over all splits, SEQC C vs D, power simulation
 # step13  rho test versus a raw-agreement test (unequal replicate noise)
+# step14  TIF copies of the figures for journal submission
 # =====================================================================
 
 # ---- step00: folders and settings ----
@@ -1965,3 +1966,37 @@ if (!REDO_STEP13 && file.exists(f13a)) {
   cat(sprintf("step13 done. Time: %.1f min\n", as.numeric(difftime(Sys.time(), t13, units = "mins"))))
 }
 cat("step13 output files:", f13a, "\n")
+
+# ---- step14: TIF copies of the figures for journal submission ----
+REDO_STEP14 <- FALSE  # TRUE rewrites the TIF files
+TIF_DPI     <- 1600   # same resolution as the PNG files
+tif_files <- file.path(fig_dir, paste0("Fig", 1:5, ".tif"))
+
+png_to_tif_A <- function(fp, ft) {                              # method A: magick package
+  if (!requireNamespace("magick", quietly = TRUE)) install.packages("magick", repos = "https://cloud.r-project.org")
+  im <- magick::image_read(fp)
+  magick::image_write(im, ft, format = "tiff", compression = "LZW", density = paste0(TIF_DPI, "x", TIF_DPI))
+  TRUE
+}
+png_to_tif_B <- function(fp, ft) {                              # method B: base R tiff device
+  if (!requireNamespace("png", quietly = TRUE)) install.packages("png", repos = "https://cloud.r-project.org")
+  im <- png::readPNG(fp); h <- dim(im)[1]; w <- dim(im)[2]
+  tiff(ft, width = w, height = h, units = "px", res = TIF_DPI, compression = "lzw")
+  par(mar = c(0, 0, 0, 0)); plot.new(); plot.window(c(0, 1), c(0, 1), xaxs = "i", yaxs = "i")
+  rasterImage(im, 0, 0, 1, 1, interpolate = FALSE); dev.off()
+  TRUE
+}
+
+if (!REDO_STEP14 && all(file.exists(tif_files))) {
+  cat("step14 outputs exist, skipping (set REDO_STEP14 <- TRUE to rerun).\n")
+} else {
+  for (i in 1:5) {
+    fp <- file.path(fig_dir, paste0("Fig", i, ".png")); ft <- tif_files[i]
+    if (!file.exists(fp)) { cat("step14: missing", fp, "\n"); next }
+    ok <- tryCatch(png_to_tif_A(fp, ft), error = function(e) { cat("  method A failed:", conditionMessage(e), "\n"); FALSE })
+    if (!ok) ok <- tryCatch(png_to_tif_B(fp, ft), error = function(e) { cat("  method B failed:", conditionMessage(e), "\n"); FALSE })
+    cat(sprintf("step14: Fig%d.tif %s (%.1f MB)\n", i, if (ok) "written" else "FAILED",
+                if (file.exists(ft)) file.size(ft) / 1e6 else 0))
+  }
+}
+cat("step14 output files: figures/Fig1.tif ... Fig5.tif (PNG and PDF files are unchanged)\n")
