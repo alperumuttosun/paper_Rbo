@@ -2,7 +2,7 @@
 # Noise-ceiling normalisation of rank-biased overlap (RBO)
 # for the between-laboratory reproducibility of ranked gene lists
 #
-# Cumulative pipeline, step00-step15. Each step writes CSV files and
+# Cumulative pipeline, step00-step16. Each step writes CSV files and
 # is skipped when its outputs already exist (set REDO_STEPxx <- TRUE to rerun).
 # Internet access is needed only once, in step03 (data download).
 #
@@ -22,6 +22,7 @@
 # step13  rho test versus a raw-agreement test (unequal replicate noise)
 # step14  TIF copies of the figures for journal submission
 # step15  processed data as gzip CSV (software-independent copies)
+# step16  ties near the top of the lists; one laboratory with twice the replicate SD
 # =====================================================================
 
 # ---- step00: folders and settings ----
@@ -2049,3 +2050,72 @@ if (!REDO_STEP15 && all(file.exists(f15))) {
   }
 }
 cat("step15 output files:", f15, "\n")
+
+# ---- step16: ties near the top of the lists and one laboratory with twice the replicate SD ----
+REDO_STEP16 <- FALSE  # TRUE recomputes the step
+R_16        <- 100    # data sets per scenario (parallel)
+R_16_SER    <- 40     # data sets per scenario if run serially
+B_16        <- 49     # permutations per data set
+f16a <- "step16a_ties.csv"
+f16b <- "step16b_noisy_lab_2sd.csv"
+
+tie_info <- function(sc) {                                        # ties among the 101 largest |score|
+  v <- unname(sort(abs(sc), decreasing = TRUE))[1:(K_LIST + 1)]
+  c(any_tie = any(duplicated(v)), boundary_tie = v[K_LIST] == v[K_LIST + 1])
+}
+
+if (!REDO_STEP16 && file.exists(f16a)) {
+  cat("step16a outputs exist, skipping (set REDO_STEP16 <- TRUE to rerun).\n")
+} else {
+  par10 <- readRDS(f_par); ds10 <- list()
+  if (file.exists(f_maqc)) ds10$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds10$SEQC <- prep_seqc(readRDS(f_seqc))
+  out16 <- list()
+  for (cfg in list(c("MAQC", "A-B"), c("MAQC", "C-D"), c("SEQC", "A-B"))) {
+    if (is.null(ds10[[cfg[1]]])) next
+    rl <- real_labs(cfg[1], cfg[2])
+    for (ln in names(rl$labs)) {
+      lab  <- rl$labs[[ln]]
+      full <- tie_info(score_fun(lab$A, lab$B, "LFC"))            # list from all replicates
+      SA <- combn(ncol(lab$A), 2, simplify = FALSE); SB <- combn(ncol(lab$B), 2, simplify = FALSE)
+      two <- do.call(rbind, lapply(SA, function(a) do.call(rbind, lapply(SB, function(b)
+        tie_info(score_fun(lab$A[, a, drop = FALSE], lab$B[, b, drop = FALSE], "LFC"))))))   # all two-replicate lists
+      out16[[length(out16) + 1]] <- data.frame(dataset = cfg[1], contrast = cfg[2], lab = ln,
+        full_any_tie = full[["any_tie"]], full_boundary_tie = full[["boundary_tie"]],
+        n_two_rep_lists = nrow(two), two_rep_any_tie = sum(two[, "any_tie"]),
+        two_rep_boundary_tie = sum(two[, "boundary_tie"]))
+    }
+  }
+  write.csv(do.call(rbind, out16), f16a, row.names = FALSE)
+  print(read.csv(f16a))
+}
+
+if (!REDO_STEP16 && file.exists(f16b)) {
+  cat("step16b outputs exist, skipping (set REDO_STEP16 <- TRUE to rerun).\n")
+} else {
+  t16 <- Sys.time(); set.seed(20261105); par16 <- readRDS(f_par); res16 <- NULL
+  for (bn in c("MAQC", "SEQC")) {
+    cp16 <- par16[[paste(bn, "A-B")]]; if (is.null(cp16)) next
+    cp16 <- prefilter(cp16, M_REP, median(cp16$sigma^2)); n16 <- n_rep_of[[bn]]
+    noise16 <- c(1, 1, 1, 1, 1, 2)                                # laboratory 6 has twice the replicate SD
+    cat(sprintf("16b: %s (%d data sets x %d permutations)...\n", bn, R_16, B_16))
+    v <- do.call(rbind, run_reps(R_16, function(r) {              # method A: parallel; method B: serial
+      labs_s <- lapply(1:6, function(l) sim_lab(cp16, n16, 0, noise16[l]))
+      obs  <- glob_stat2_n(labs_s, SPL10, BTW10, by_lab = TRUE)
+      perm <- replicate(B_16, glob_stat2_n(permute_labs(labs_s), SPL10, BTW10))
+      c(T_rho = obs[["rho"]], T_E = obs[["E"]],
+        p_rho = (1 + sum(perm["rho", ] <= obs[["rho"]])) / (B_16 + 1),
+        p_E   = (1 + sum(perm["E", ] <= obs[["E"]])) / (B_16 + 1),
+        lab6_worst_rho = obs[["worst_rho"]] == 6, lab6_worst_E = obs[["worst_E"]] == 6)
+    }, n_serial = R_16_SER))
+    res16 <- rbind(res16, data.frame(base = bn, scenario = "one_noisy_lab_2.0", n_sim = nrow(v), B_perm = B_16,
+      mean_T_rho = mean(v[, "T_rho"]), mean_T_E = mean(v[, "T_E"]),
+      reject05_rho = mean(v[, "p_rho"] <= 0.05), reject05_E = mean(v[, "p_E"] <= 0.05),
+      reject10_rho = mean(v[, "p_rho"] <= 0.10), reject10_E = mean(v[, "p_E"] <= 0.10),
+      lab6_lowest_rho = mean(v[, "lab6_worst_rho"]), lab6_lowest_E = mean(v[, "lab6_worst_E"])))
+    write.csv(res16, f16b, row.names = FALSE)
+  }
+  print(res16, digits = 3)
+  cat(sprintf("step16 done. Time: %.1f min\n", as.numeric(difftime(Sys.time(), t16, units = "mins"))))
+}
+cat("step16 output files:", f16a, f16b, "\n")
