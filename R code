@@ -2,7 +2,7 @@
 # Noise-ceiling normalisation of rank-biased overlap (RBO)
 # for the between-laboratory reproducibility of ranked gene lists
 #
-# Cumulative pipeline, step00-step16. Each step writes CSV files and
+# Cumulative pipeline, step00-step17. Each step writes CSV files and
 # is skipped when its outputs already exist (set REDO_STEPxx <- TRUE to rerun).
 # Internet access is needed only once, in step03 (data download).
 #
@@ -23,6 +23,7 @@
 # step14  TIF copies of the figures for journal submission
 # step15  processed data as gzip CSV (software-independent copies)
 # step16  ties near the top of the lists; one laboratory with twice the replicate SD
+# step17  replicate SD of each laboratory in the real data
 # =====================================================================
 
 # ---- step00: folders and settings ----
@@ -2119,3 +2120,30 @@ if (!REDO_STEP16 && file.exists(f16b)) {
   cat(sprintf("step16 done. Time: %.1f min\n", as.numeric(difftime(Sys.time(), t16, units = "mins"))))
 }
 cat("step16 output files:", f16a, f16b, "\n")
+
+# ---- step17: replicate SD of each laboratory in the real data ----
+REDO_STEP17 <- FALSE  # TRUE recomputes the step
+f17 <- "step17_replicate_sd_by_lab.csv"
+
+if (!REDO_STEP17 && file.exists(f17)) {
+  cat("step17 outputs exist, skipping (set REDO_STEP17 <- TRUE to rerun).\n")
+} else {
+  par10 <- readRDS(f_par); ds10 <- list()
+  if (file.exists(f_maqc)) ds10$MAQC <- prep_maqc(readRDS(f_maqc))
+  if (file.exists(f_seqc)) ds10$SEQC <- prep_seqc(readRDS(f_seqc))
+  out17 <- list()
+  for (cfg in list(c("MAQC", "A-B"), c("MAQC", "C-D"), c("SEQC", "A-B"))) {
+    if (is.null(ds10[[cfg[1]]])) next
+    rl <- real_labs(cfg[1], cfg[2])
+    sd_lab <- sapply(rl$labs, function(l) {                       # pooled within-laboratory replicate SD per gene
+      s2 <- (rowSums((l$A - rowMeans(l$A))^2) + rowSums((l$B - rowMeans(l$B))^2)) / (ncol(l$A) + ncol(l$B) - 2)
+      median(sqrt(s2))                                            # median over the prefiltered genes
+    })
+    out17[[length(out17) + 1]] <- data.frame(dataset = cfg[1], contrast = cfg[2], lab = names(sd_lab),
+      median_sd = sd_lab, ratio_to_median_lab = sd_lab / median(sd_lab),
+      max_over_min_in_config = max(sd_lab) / min(sd_lab))
+  }
+  write.csv(do.call(rbind, out17), f17, row.names = FALSE)
+  print(read.csv(f17), digits = 3)
+}
+cat("step17 output files:", f17, "\n")
