@@ -1,4 +1,5 @@
 # Welcome
+
 The `data` folder contains the processed data used in the analyses.
 
 The `figures` folder contains the figures in TIFF, PDF and PNG format.
@@ -25,3 +26,6 @@ The `results` folder contains the results as CSV files.
 | step13 | Test on rho versus test on raw agreement |
 | step14 | TIF copies of the figures |
 | step15 | Processed data as gzip CSV |
+| step16 | Ties near the top of the ranked lists; global test with one laboratory at twice the replicate SD |
+| step17 | Replicate SD of each laboratory in the real data |
+
